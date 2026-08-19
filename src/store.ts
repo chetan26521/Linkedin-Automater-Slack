@@ -1,10 +1,11 @@
 import { Redis } from "@upstash/redis";
+import { config } from "./config.js";
 import type { ContentStyle } from "./postWriter.js";
 
 // Serverless functions don't share memory across invocations, so drafts and pending
-// requests live in Redis (via Vercel's Upstash integration) instead of an in-process
-// Map, keyed with a TTL. Redis.fromEnv() reads UPSTASH_REDIS_REST_URL/_TOKEN.
-const redis = Redis.fromEnv();
+// requests live in Redis (via Vercel's Storage integration) instead of an in-process
+// Map, keyed with a TTL.
+const redis = new Redis({ url: config.redisUrl, token: config.redisToken });
 const TTL_SECONDS = 30 * 60; // entries expire 30 min after creation if never resolved
 
 export interface Draft {

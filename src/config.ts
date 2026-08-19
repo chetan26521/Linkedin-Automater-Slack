@@ -32,6 +32,10 @@ export const config = {
   slackSigningSecret: required("SLACK_SIGNING_SECRET"),
   slackChannelId: required("SLACK_CHANNEL_ID"),
   port: Number(process.env.PORT ?? 3000),
+  // Vercel's Storage tab injects these under the legacy KV_* names (a holdover from
+  // the deprecated @vercel/kv product) even though the underlying database is Redis.
+  redisUrl: required("KV_REST_API_URL"),
+  redisToken: required("KV_REST_API_TOKEN"),
   llmProvider,
   openrouterApiKey: requiredForProvider("OPENROUTER_API_KEY", "openrouter"),
   openrouterModel: process.env.OPENROUTER_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b:free",
