@@ -1,37 +1,11 @@
+import { Redis } from "@upstash/redis";
 import type { ContentStyle } from "./postWriter.js";
 
-const TTL_MS = 30 * 60 * 1000; // entries expire 30 min after creation if never resolved
-
-function createTtlStore<T extends { id: string }>() {
-  const items = new Map<string, T>();
-  const timers = new Map<string, NodeJS.Timeout>();
-
-  function save(item: T): void {
-    const existingTimer = timers.get(item.id);
-    if (existingTimer) clearTimeout(existingTimer);
-
-    items.set(item.id, item);
-    const timer = setTimeout(() => {
-      items.delete(item.id);
-      timers.delete(item.id);
-    }, TTL_MS);
-    timer.unref();
-    timers.set(item.id, timer);
-  }
-
-  function get(id: string): T | undefined {
-    return items.get(id);
-  }
-
-  function remove(id: string): void {
-    const existingTimer = timers.get(id);
-    if (existingTimer) clearTimeout(existingTimer);
-    timers.delete(id);
-    items.delete(id);
-  }
-
-  return { save, get, remove };
-}
+// Serverless functions don't share memory across invocations, so drafts and pending
+// requests live in Redis (via Vercel's Upstash integration) instead of an in-process
+// Map, keyed with a TTL. Redis.fromEnv() reads UPSTASH_REDIS_REST_URL/_TOKEN.
+const redis = Redis.fromEnv();
+const TTL_SECONDS = 30 * 60; // entries expire 30 min after creation if never resolved
 
 export interface Draft {
   id: string;
@@ -45,15 +19,25 @@ export interface Draft {
   createdAt: number;
 }
 
-const draftStore = createTtlStore<Draft>();
-export const saveDraft = draftStore.save;
-export const getDraft = draftStore.get;
-export const deleteDraft = draftStore.remove;
+const draftKey = (id: string) => `draft:${id}`;
 
-export function updateDraftText(id: string, text: string): void {
-  const draft = draftStore.get(id);
+export async function saveDraft(draft: Draft): Promise<void> {
+  await redis.set(draftKey(draft.id), draft, { ex: TTL_SECONDS });
+}
+
+export async function getDraft(id: string): Promise<Draft | undefined> {
+  const draft = await redis.get<Draft>(draftKey(id));
+  return draft ?? undefined;
+}
+
+export async function updateDraftText(id: string, text: string): Promise<void> {
+  const draft = await getDraft(id);
   if (!draft) return;
-  draftStore.save({ ...draft, text });
+  await saveDraft({ ...draft, text });
+}
+
+export async function deleteDraft(id: string): Promise<void> {
+  await redis.del(draftKey(id));
 }
 
 // Holds a topic (and thread context) after "create a post" but before the user has
@@ -68,7 +52,17 @@ export interface PendingRequest {
   createdAt: number;
 }
 
-const pendingRequestStore = createTtlStore<PendingRequest>();
-export const savePendingRequest = pendingRequestStore.save;
-export const getPendingRequest = pendingRequestStore.get;
-export const deletePendingRequest = pendingRequestStore.remove;
+const pendingKey = (id: string) => `pending:${id}`;
+
+export async function savePendingRequest(req: PendingRequest): Promise<void> {
+  await redis.set(pendingKey(req.id), req, { ex: TTL_SECONDS });
+}
+
+export async function getPendingRequest(id: string): Promise<PendingRequest | undefined> {
+  const req = await redis.get<PendingRequest>(pendingKey(id));
+  return req ?? undefined;
+}
+
+export async function deletePendingRequest(id: string): Promise<void> {
+  await redis.del(pendingKey(id));
+}

@@ -1,6 +1,7 @@
-import { app } from "./slackApp.js";
+import { receiver } from "./slackApp.js";
+import { config } from "./config.js";
 
-(async () => {
-  await app.start();
-  console.log("⚡️ LinkedIn post bot is running (Socket Mode) — say \"create a post\" in Slack to try it.");
-})();
+receiver.app.listen(config.port, () => {
+  console.log(`⚡️ LinkedIn post bot listening on http://localhost:${config.port}/api/slack/events`);
+  console.log(`For Slack to reach this locally, tunnel it (e.g. \`ngrok http ${config.port}\`) and set the tunnel URL + /api/slack/events as your Slack app's Request URL.`);
+});

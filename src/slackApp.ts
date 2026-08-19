@@ -1,11 +1,12 @@
 import Bolt from "@slack/bolt";
 import { randomUUID } from "node:crypto";
+import { waitUntil } from "@vercel/functions";
 import { config } from "./config.js";
 import { generatePostText, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
 import { publishPost } from "./linkedin.js";
 import { saveDraft, getDraft, updateDraftText, deleteDraft, savePendingRequest, getPendingRequest, deletePendingRequest } from "./store.js";
 
-const { App } = Bolt;
+const { App, ExpressReceiver } = Bolt;
 
 // Matches "create a post" anywhere in the message, case-insensitive.
 const TRIGGER = new RegExp(config.triggerPhrase, "i");
@@ -62,18 +63,32 @@ function regenerateBlocks(draftId: string) {
   ];
 }
 
-export const app = new App({
-  token: config.slackBotToken,
-  appToken: config.slackAppToken,
-  socketMode: true,
+// ExpressReceiver over Slack's HTTP Events API + Interactivity, instead of Socket Mode —
+// a Vercel serverless function can't hold a persistent WebSocket connection open.
+export const receiver = new ExpressReceiver({
+  signingSecret: config.slackSigningSecret,
+  endpoints: "/api/slack/events",
 });
 
-app.message(async ({ message, say, client }) => {
+export const app = new App({
+  token: config.slackBotToken,
+  receiver,
+});
+
+// Bolt sends the required HTTP 200 for events as soon as the payload is verified,
+// before this listener runs — so everything below is already "after the response"
+// and must be wrapped in waitUntil() to survive on a serverless function. Same
+// reasoning applies to every action handler below, right after ack().
+app.message(async ({ message, client }) => {
   const msg = message as any;
   if (msg.subtype || !msg.text || msg.bot_id) return;
   if (msg.channel !== config.slackChannelId) return; // only listen in the configured channel
   if (!TRIGGER.test(msg.text)) return; // only the "create a post" flow triggers anything
 
+  waitUntil(handleTrigger(msg, client));
+});
+
+async function handleTrigger(msg: any, client: any) {
   const topic = msg.text.replace(TRIGGER, "").trim().replace(LEADING_CONNECTOR, "").trim() || msg.text;
   const threadTs = msg.thread_ts || msg.ts;
 
@@ -82,13 +97,13 @@ app.message(async ({ message, say, client }) => {
     if (msg.thread_ts) {
       const replies = await client.conversations.replies({ channel: msg.channel, ts: msg.thread_ts, limit: 20 });
       threadContext = (replies.messages ?? [])
-        .filter((m) => m.ts !== msg.ts && m.text)
-        .map((m) => m.text)
+        .filter((m: any) => m.ts !== msg.ts && m.text)
+        .map((m: any) => m.text)
         .join("\n");
     }
 
     const pendingId = randomUUID();
-    savePendingRequest({
+    await savePendingRequest({
       id: pendingId,
       topic,
       threadContext,
@@ -106,9 +121,9 @@ app.message(async ({ message, say, client }) => {
     });
   } catch (err: any) {
     console.error(err);
-    await say({ text: `Something went wrong: ${err.message}`, thread_ts: threadTs });
+    await client.chat.postMessage({ channel: msg.channel, thread_ts: threadTs, text: `Something went wrong: ${err.message}` });
   }
-});
+}
 
 app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, action, body, client }) => {
   await ack();
@@ -118,7 +133,11 @@ app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, ac
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
 
-  const pending = getPendingRequest(pendingId);
+  waitUntil(handleStyleSelected(contentStyle, pendingId, channel, messageTs, client));
+});
+
+async function handleStyleSelected(contentStyle: ContentStyle, pendingId: string, channel: string, messageTs: string, client: any) {
+  const pending = await getPendingRequest(pendingId);
   if (!pending) {
     await client.chat.update({ channel, ts: messageTs, text: "This request expired — ask me to create a post again.", blocks: [] });
     return;
@@ -129,7 +148,7 @@ app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, ac
 
   try {
     const { postText } = await generatePostText(pending.topic, contentStyle, pending.threadContext);
-    deletePendingRequest(pendingId);
+    await deletePendingRequest(pendingId);
 
     const draftId = randomUUID();
     const draftMessage = await client.chat.postMessage({
@@ -138,7 +157,7 @@ app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, ac
       text: `*Draft LinkedIn post:*\n\n${postText}`,
     });
 
-    saveDraft({
+    await saveDraft({
       id: draftId,
       text: postText,
       topic: pending.topic,
@@ -162,7 +181,7 @@ app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, ac
     console.error(err);
     await client.chat.update({ channel, ts: messageTs, text: `Something went wrong drafting the post: ${err.message}`, blocks: [] });
   }
-});
+}
 
 app.action("approve_post", async ({ ack, body, client }) => {
   await ack();
@@ -171,7 +190,11 @@ app.action("approve_post", async ({ ack, body, client }) => {
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
 
-  const draft = getDraft(draftId);
+  waitUntil(handleApprove(draftId, channel, messageTs, client));
+});
+
+async function handleApprove(draftId: string, channel: string, messageTs: string, client: any) {
+  const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: "This draft expired — ask me to create a post again." });
     return;
@@ -181,13 +204,13 @@ app.action("approve_post", async ({ ack, body, client }) => {
 
   try {
     await publishPost(draft.text);
-    deleteDraft(draftId);
+    await deleteDraft(draftId);
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: "✅ Posted to LinkedIn." });
   } catch (err: any) {
     console.error(err);
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: `❌ Failed to post to LinkedIn: ${err.message}` });
   }
-});
+}
 
 app.action("reject_post", async ({ ack, body, client }) => {
   await ack();
@@ -196,7 +219,11 @@ app.action("reject_post", async ({ ack, body, client }) => {
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
 
-  const draft = getDraft(draftId);
+  waitUntil(handleReject(draftId, channel, messageTs, client));
+});
+
+async function handleReject(draftId: string, channel: string, messageTs: string, client: any) {
+  const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.update({ channel, ts: messageTs, text: "This draft expired — ask me to create a post again.", blocks: [] });
     return;
@@ -208,7 +235,7 @@ app.action("reject_post", async ({ ack, body, client }) => {
     text: "What would you like to change?",
     blocks: regenerateBlocks(draftId),
   });
-});
+}
 
 app.action(/^regenerate_(shorter|professional|punchier|different-angle)$/, async ({ ack, action, body, client }) => {
   await ack();
@@ -218,7 +245,11 @@ app.action(/^regenerate_(shorter|professional|punchier|different-angle)$/, async
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
 
-  const draft = getDraft(draftId);
+  waitUntil(handleRegenerate(style, draftId, channel, messageTs, client));
+});
+
+async function handleRegenerate(style: RefinementStyle, draftId: string, channel: string, messageTs: string, client: any) {
+  const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.update({ channel, ts: messageTs, text: "This draft expired — ask me to create a post again.", blocks: [] });
     return;
@@ -228,7 +259,7 @@ app.action(/^regenerate_(shorter|professional|punchier|different-angle)$/, async
 
   try {
     const { postText } = await generatePostText(draft.topic, draft.contentStyle, draft.threadContext, { style, previousText: draft.text });
-    updateDraftText(draftId, postText);
+    await updateDraftText(draftId, postText);
 
     await client.chat.update({ channel, ts: draft.messageTs, text: `*Draft LinkedIn post:*\n\n${postText}` });
     await client.chat.update({ channel, ts: messageTs, text: "Post the above to LinkedIn?", blocks: confirmBlocks(draftId) });
@@ -236,7 +267,7 @@ app.action(/^regenerate_(shorter|professional|punchier|different-angle)$/, async
     console.error(err);
     await client.chat.update({ channel, ts: messageTs, text: `❌ Failed to regenerate: ${err.message}`, blocks: [] });
   }
-});
+}
 
 app.action("dismiss_draft", async ({ ack, body, client }) => {
   await ack();
@@ -245,6 +276,10 @@ app.action("dismiss_draft", async ({ ack, body, client }) => {
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
 
-  deleteDraft(draftId);
-  await client.chat.update({ channel, ts: messageTs, text: "🗑️ Discarded — nothing was posted to LinkedIn.", blocks: [] });
+  waitUntil(handleDismiss(draftId, channel, messageTs, client));
 });
+
+async function handleDismiss(draftId: string, channel: string, messageTs: string, client: any) {
+  await deleteDraft(draftId);
+  await client.chat.update({ channel, ts: messageTs, text: "🗑️ Discarded — nothing was posted to LinkedIn.", blocks: [] });
+}

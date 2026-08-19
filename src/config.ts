@@ -29,8 +29,9 @@ function requiredForProvider(name: string, provider: LlmProvider): string {
 
 export const config = {
   slackBotToken: required("SLACK_BOT_TOKEN"),
-  slackAppToken: required("SLACK_APP_TOKEN"),
+  slackSigningSecret: required("SLACK_SIGNING_SECRET"),
   slackChannelId: required("SLACK_CHANNEL_ID"),
+  port: Number(process.env.PORT ?? 3000),
   llmProvider,
   openrouterApiKey: requiredForProvider("OPENROUTER_API_KEY", "openrouter"),
   openrouterModel: process.env.OPENROUTER_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b:free",
