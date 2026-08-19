@@ -3,6 +3,9 @@
   "functions": {
     "api/slack/events.ts": {
       "maxDuration": 60
+    },
+    "api/calendar/publish.ts": {
+      "maxDuration": 60
     }
   }
 }

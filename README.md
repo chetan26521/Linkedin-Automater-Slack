@@ -8,7 +8,16 @@ Say **"create a post: <topic>"** in a Slack channel the bot is in. It will:
 4. Only publish to your LinkedIn profile if you click **Post to LinkedIn**. Ignoring it entirely means nothing is ever posted (both the pending style request and any draft expire after 30 minutes).
 5. Clicking **❌ Reject** doesn't discard anything yet — it shows a follow-up: **📏 Shorter**, **👔 More Professional**, **🔥 Punchier**, **🔀 Different Angle**, or **🗑️ Dismiss**. Picking a style regenerates the post (same topic/thread context/content style, revised per that feedback) and shows the Post/Reject buttons again — you can loop through as many regenerations as you like. **Dismiss** is the only action that actually throws the draft away.
 
-No message without "create a post" in it does anything — the bot ignores all other channel chatter.
+Say **"content calendar"** for a second flow that plans and schedules a whole series of posts:
+
+1. The bot asks what topic the calendar should be about — your *next message in the same thread* is treated as the answer (no need to repeat the trigger phrase).
+2. It then shows one message with a content-style dropdown, a multi-select for which weekdays to post on, and a time picker. Fill all three in and click **📅 Generate Calendar**.
+3. The bot breaks the topic into its natural content pillars (however many genuinely fit — typically 3–6) and proposes a schedule: one pillar per post, landing on the next occurrences of your chosen weekdays at your chosen time (computed in your own Slack timezone). Buttons: **✅ Approve & Schedule**, **🔄 Regenerate**, **🗑️ Dismiss**.
+4. Approving schedules each post via [Upstash QStash](https://upstash.com/docs/qstash) to fire on its own date — nothing is generated yet. When a post's date arrives, it's generated automatically and sent to Slack with the exact same **✅ Post to LinkedIn** / **❌ Reject** flow as above; nothing publishes without that manual approval on the day.
+
+Requires QStash to be configured (see step 7) — without it, the calendar can be built and reviewed but Approve will fail to schedule anything.
+
+No message without "create a post" or "content calendar" in it does anything — the bot ignores all other channel chatter.
 
 ## 1. Install dependencies
 
@@ -56,7 +65,7 @@ The bot runs over Slack's HTTP Events API + Interactivity (no Socket Mode) so it
 cp .env.example .env
 ```
 
-Fill in `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `LLM_PROVIDER` + its matching API key, `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`. Leave `UPSTASH_REDIS_REST_URL`/`_TOKEN` for step 6.
+Fill in `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `LLM_PROVIDER` + its matching API key, `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`. Leave `KV_REST_API_URL`/`_TOKEN` for step 6 and `QSTASH_*`/`APP_BASE_URL` for step 7 (only needed for the content calendar).
 
 Then run the one-time LinkedIn connect script:
 
@@ -81,19 +90,32 @@ Drafts and pending style requests are stored in Redis (not in memory), since a s
 
 The `maxDuration` for the function is set to 60s in [vercel.json](vercel.json) — LLM generation and LinkedIn publishing can both take a few seconds, and this needs enough headroom to not get cut off mid-request. Increase it if you're on a plan that allows longer, or if a slower model needs more room.
 
-## 7. Run it
+## 7. Set up QStash (only needed for "content calendar")
+
+QStash schedules each calendar post to fire an HTTP call to this app at an exact future date/time — it's what makes "approve, then get posts automatically on their dates" work without a persistent server.
+
+1. Go to https://console.upstash.com → **QStash** (same account as your Redis database from step 6).
+2. Copy the **Token**, **Current Signing Key**, and **Next Signing Key** from the QStash dashboard into `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` — in both your local `.env` and Vercel's env vars.
+3. `APP_BASE_URL` can usually be left blank — it falls back to `https://$VERCEL_URL`, which Vercel sets automatically at runtime. Set it explicitly (to your stable production URL or custom domain) only if you want QStash to always target that instead of whichever deployment happens to be current, or if you're testing locally via a tunnel.
+4. Redeploy (or just start using it — env var changes apply on the next invocation/deploy).
+
+If you skip this step, "create a post" works exactly as before; "content calendar" will build and let you review a schedule, but clicking **Approve & Schedule** will fail with a clear error until these are set.
+
+## 8. Run it
 
 ```
 npm run dev
 ```
 
-Then in Slack: `create a post: we just shipped X, here's why it matters`
+Then in Slack: `create a post: we just shipped X, here's why it matters`, or `content calendar` to plan a series.
 
 ## Notes / things to check before relying on this
 
 - LinkedIn bumps its API version string monthly (`LINKEDIN_VERSION` in [src/linkedin.ts](src/linkedin.ts)). If publishing starts failing with a version-related error, check LinkedIn's current version at https://learn.microsoft.com/en-us/linkedin/marketing/versioning and update it.
 - Pending style requests and drafts (text only) live in Redis with a 30-minute TTL, keyed by an id on the Slack buttons. If you never click through, they just expire — you'd ask it to create the post again.
 - This is scoped to your personal LinkedIn profile (`w_member_social`). Posting to a company Page needs the `w_organization_social` scope and admin access to that Page, which isn't wired up here.
-- The trigger phrase is `"create a post"` (case-insensitive substring match), configurable via `TRIGGER_PHRASE` in `.env`.
+- The trigger phrases are `"create a post"` and `"content calendar"` (case-insensitive substring match), configurable via `TRIGGER_PHRASE` / `CALENDAR_TRIGGER_PHRASE` in `.env`.
 - OpenRouter's free models can be lower quality than paid ones and occasionally get rate-limited or rotated out (see step 2). Switching `LLM_PROVIDER` to `openai` or `anthropic` is a config-only change — no code edits needed.
 - Every Slack button click acks immediately, then does the slow work (LLM call, LinkedIn publish) wrapped in `waitUntil()` from `@vercel/functions` ([src/slackApp.ts](src/slackApp.ts)) — this is required on Vercel because a serverless function's execution environment can otherwise be frozen right after the HTTP response is sent, silently killing any work still in flight.
+- A generated calendar's schedule math ([src/calendar.ts](src/calendar.ts)) uses a fixed timezone offset captured once (from the requester's Slack profile) rather than a full IANA-aware calculation — a daylight-saving transition partway through a multi-week calendar could shift a post by an hour. Not worth a timezone library for this internal tool, but worth knowing.
+- The "what topic?" question after "content calendar" only recognizes an answer if it's a reply *in the same thread* as the question, from the same person who triggered it, within 10 minutes — otherwise it expires and the message falls through to normal handling (so accidentally saying "create a post" right after won't get swallowed).

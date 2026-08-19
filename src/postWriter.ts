@@ -76,6 +76,19 @@ async function callAnthropic(prompt: string): Promise<string> {
   return raw;
 }
 
+// Dispatches a raw prompt to whichever LLM provider is configured. Shared by post
+// drafting and content-calendar pillar generation, so the 3-provider switch lives once.
+export async function generateFromPrompt(prompt: string): Promise<string> {
+  switch (config.llmProvider) {
+    case "openai":
+      return callOpenAiCompatible("https://api.openai.com/v1/chat/completions", config.openaiApiKey, config.openaiModel, prompt, "OpenAI");
+    case "anthropic":
+      return callAnthropic(prompt);
+    default:
+      return callOpenAiCompatible("https://openrouter.ai/api/v1/chat/completions", config.openrouterApiKey, config.openrouterModel, prompt, "OpenRouter");
+  }
+}
+
 export async function generatePostText(topic: string, contentStyle: ContentStyle, threadContext?: string, refinement?: Refinement): Promise<GeneratedPost> {
   const styleInstruction = CONTENT_STYLES.find((s) => s.style === contentStyle)?.instruction;
   const refinementInstruction = refinement && REFINEMENT_STYLES.find((r) => r.style === refinement.style)?.instruction;
@@ -106,17 +119,5 @@ Output format — read carefully:
 - Do not use separators like "---", headings, or wrap the post in quotes or code fences.
 - The first character of your response must be the first character of the post itself, and the last character must be the end of the post (its final word or hashtag).`;
 
-  let raw: string;
-  switch (config.llmProvider) {
-    case "openai":
-      raw = await callOpenAiCompatible("https://api.openai.com/v1/chat/completions", config.openaiApiKey, config.openaiModel, prompt, "OpenAI");
-      break;
-    case "anthropic":
-      raw = await callAnthropic(prompt);
-      break;
-    default:
-      raw = await callOpenAiCompatible("https://openrouter.ai/api/v1/chat/completions", config.openrouterApiKey, config.openrouterModel, prompt, "OpenRouter");
-  }
-
-  return { postText: raw };
+  return { postText: await generateFromPrompt(prompt) };
 }
