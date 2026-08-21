@@ -199,7 +199,15 @@ function calendarSummaryText(topic: string, contentStyle: ContentStyle, duration
 // cell — a compact visual companion to the detailed list in calendarSummaryText.
 function calendarGridText(pillars: CalendarPillar[], tzOffsetSeconds: number): string {
   const COL_WIDTH = 15;
-  const pad = (s: string, width: number) => (s.length > width ? s.slice(0, width - 1) + "…" : s.padEnd(width));
+  // Plain ASCII only (no "▸"/"…") and code-point-aware (not raw UTF-16 slice/length) so a
+  // stray non-ASCII character in real content can't silently break column alignment or get
+  // corrupted mid-surrogate-pair — pillar names are sanitized upstream, but this is the
+  // layer that actually determines what renders, so it shouldn't depend on that alone.
+  const pad = (s: string, width: number) => {
+    const chars = Array.from(s);
+    if (chars.length <= width) return s + " ".repeat(width - chars.length);
+    return chars.slice(0, Math.max(0, width - 3)).join("") + "...";
+  };
   const toLocalDay = (epochSeconds: number) => {
     const d = new Date((epochSeconds + tzOffsetSeconds) * 1000);
     return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -224,7 +232,7 @@ function calendarGridText(pillars: CalendarPillar[], tzOffsetSeconds: number): s
       const day = new Date(cursor);
       day.setUTCDate(day.getUTCDate() + i);
       const pillar = pillarByDate.get(dateKey(day));
-      dateLine.push(pad(`${pillar ? "▸ " : "  "}${MONTHS_SHORT[day.getUTCMonth()]} ${day.getUTCDate()}`, COL_WIDTH));
+      dateLine.push(pad(`${pillar ? "* " : "  "}${MONTHS_SHORT[day.getUTCMonth()]} ${day.getUTCDate()}`, COL_WIDTH));
       pillarLine.push(pad(pillar ? `  ${pillar}` : "", COL_WIDTH));
     }
     lines.push(dateLine.join(""), pillarLine.join(""));

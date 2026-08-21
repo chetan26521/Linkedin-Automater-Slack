@@ -38,7 +38,10 @@ sharing a pillar never feel repetitive.
 Output format — read carefully:
 - Respond with ONLY a JSON array of exactly ${postCount} objects, nothing else. No preamble, no
   markdown fences, no commentary.
-- Shape: [{"pillar": "<short pillar name>", "prompt": "<one-sentence writing prompt, self-contained>"}, ...]`;
+- Shape: [{"pillar": "<short pillar name>", "prompt": "<one-sentence writing prompt, self-contained>"}, ...]
+- "pillar" must be plain text only — no emoji or decorative symbols (it's rendered in a
+  fixed-width text calendar grid, where those break column alignment). "prompt" has no such
+  restriction.`;
 
   const raw = await generateFromPrompt(prompt);
   // Strip a markdown code fence if the model wrapped the JSON in one despite instructions.
@@ -59,8 +62,27 @@ Output format — read carefully:
     if (typeof p?.pillar !== "string" || typeof p?.prompt !== "string") {
       throw new Error(`Malformed pillar at index ${i}: ${JSON.stringify(p)}`);
     }
-    return { pillar: p.pillar, prompt: p.prompt };
+    // Belt-and-braces: strip emoji/pictographs even though the prompt asks the model not
+    // to include them — the fixed-width calendar grid's column alignment depends on it,
+    // and models don't always follow formatting instructions (see the JSON-fence handling
+    // above for the same lesson learned the hard way).
+    return { pillar: stripPictographs(p.pillar), prompt: p.prompt };
   });
+}
+
+// Strips emoji/pictographs (and their joiners/modifiers) while leaving ordinary text —
+// including accented letters — untouched. Only applied to the short pillar label used in
+// the fixed-width calendar grid; the post-writing "prompt" field is left fully unrestricted.
+const ZERO_WIDTH_JOINER = String.fromCharCode(0x200d);
+const VARIATION_SELECTOR_16 = String.fromCharCode(0xfe0f);
+const JOINER_AND_MODIFIER_PATTERN = new RegExp(`[${ZERO_WIDTH_JOINER}${VARIATION_SELECTOR_16}\\u{1F3FB}-\\u{1F3FF}]`, "gu");
+
+function stripPictographs(s: string): string {
+  return s
+    .replace(/\p{Extended_Pictographic}/gu, "")
+    .replace(JOINER_AND_MODIFIER_PATTERN, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 /**
