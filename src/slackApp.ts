@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import { config } from "./config.js";
 import { generatePostText, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
-import { generateContentPillars, scheduledDatesInWindow, scheduleCalendarEntry, CALENDAR_DURATIONS } from "./calendar.js";
+import { generateContentPillars, scheduledDatesInWindow, scheduleCalendarEntries, CALENDAR_DURATIONS } from "./calendar.js";
 import { publishPost } from "./linkedin.js";
 import {
   saveDraft,
@@ -444,15 +444,12 @@ async function handleApproveCalendar(reviewId: string, channel: string, messageT
   await client.chat.update({ channel, ts: messageTs, text: "Scheduling…", blocks: [] });
 
   try {
-    for (const pillar of review.pillars) {
-      await scheduleCalendarEntry(pillar.scheduledAt, {
-        topic: pillar.prompt,
-        contentStyle: review.contentStyle,
-        channel: review.channel,
-        threadTs: review.threadTs,
-        requestedBy: review.requestedBy,
-      });
-    }
+    await scheduleCalendarEntries(review.pillars, {
+      contentStyle: review.contentStyle,
+      channel: review.channel,
+      threadTs: review.threadTs,
+      requestedBy: review.requestedBy,
+    });
     await deleteCalendarReview(reviewId);
 
     const first = formatScheduledDate(review.pillars[0].scheduledAt, review.tzOffsetSeconds);

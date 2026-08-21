@@ -2,8 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Receiver } from "@upstash/qstash";
 import { config } from "../../src/config.js";
 import { app, createDraftAndPostConfirmation } from "../../src/slackApp.js";
-import type { ContentStyle } from "../../src/postWriter.js";
-import type { CalendarPublishJob } from "../../src/calendar.js";
+import { scheduleCalendarEntries, type CalendarJob } from "../../src/calendar.js";
 
 function readRawBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -14,9 +13,12 @@ function readRawBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-// Fired by QStash at the scheduled time for one content-calendar pillar. Unlike the Slack
-// endpoint, there's no 3-second-ack requirement here — QStash just waits for the HTTP
-// response, so this runs synchronously without needing waitUntil().
+// Fired by QStash for one content-calendar job — either "publish" (generate this pillar's
+// post and send it to Slack for confirmation) or "promote" (re-check a batch of entries that
+// were too far out to schedule directly last time, now that some may be within range; see
+// calendar.ts's QSTASH_MAX_DELAY_SECONDS). Unlike the Slack endpoint, there's no 3-second-ack
+// requirement here — QStash just waits for the HTTP response, so this runs synchronously
+// without needing waitUntil().
 export default async function handler(req: IncomingMessage, res: ServerResponse) {
   if (req.method !== "POST") {
     res.writeHead(405).end("Method Not Allowed");
@@ -39,7 +41,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     return;
   }
 
-  let job: CalendarPublishJob;
+  let job: CalendarJob;
   try {
     job = JSON.parse(body);
   } catch {
@@ -48,16 +50,25 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   }
 
   try {
-    await createDraftAndPostConfirmation(app.client, {
-      topic: job.topic,
-      contentStyle: job.contentStyle as ContentStyle,
-      channel: job.channel,
-      threadTs: job.threadTs,
-      requestedBy: job.requestedBy,
-    });
+    if (job.type === "promote") {
+      await scheduleCalendarEntries(job.remaining, {
+        contentStyle: job.contentStyle,
+        channel: job.channel,
+        threadTs: job.threadTs,
+        requestedBy: job.requestedBy,
+      });
+    } else {
+      await createDraftAndPostConfirmation(app.client, {
+        topic: job.topic,
+        contentStyle: job.contentStyle,
+        channel: job.channel,
+        threadTs: job.threadTs,
+        requestedBy: job.requestedBy,
+      });
+    }
     res.writeHead(200).end("OK");
   } catch (err: any) {
-    console.error("Failed to publish scheduled calendar entry:", err);
+    console.error("Failed to process calendar job:", err);
     // Let QStash retry on failure — a non-2xx response triggers its retry policy.
     res.writeHead(500).end(`Failed: ${err.message}`);
   }

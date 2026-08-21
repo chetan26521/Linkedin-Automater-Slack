@@ -1,6 +1,7 @@
 import { Client } from "@upstash/qstash";
 import { config } from "./config.js";
 import { generateFromPrompt, CONTENT_STYLES, type ContentStyle } from "./postWriter.js";
+import type { CalendarPillar } from "./store.js";
 
 export interface ContentPillar {
   pillar: string;
@@ -117,8 +118,36 @@ export function scheduledDatesInWindow(weekdays: number[], windowDays: number, t
   return results;
 }
 
+// QStash caps how far in the future a single message's `notBefore` can be — observed in
+// practice as "quota maxDelay exceeded, current limit: 604800" (exactly 7 days). A calendar
+// entry further out than that can't be scheduled directly, so it's bundled into a "promote"
+// job that re-runs scheduleCalendarEntries a bit under that limit later, which schedules
+// whatever's now within range and re-defers the rest — self-chaining forward as many times
+// as needed, entirely within QStash, until every entry has its own precise notBefore.
+const QSTASH_MAX_DELAY_SECONDS = 7 * 24 * 60 * 60;
+const QSTASH_REQUEUE_SECONDS = 6 * 24 * 60 * 60; // re-check a day inside the limit, for safety margin
+
 export interface CalendarPublishJob {
+  type: "publish";
   topic: string;
+  contentStyle: ContentStyle;
+  channel: string;
+  threadTs: string;
+  requestedBy: string;
+}
+
+export interface CalendarPromoteJob {
+  type: "promote";
+  contentStyle: ContentStyle;
+  channel: string;
+  threadTs: string;
+  requestedBy: string;
+  remaining: CalendarPillar[];
+}
+
+export type CalendarJob = CalendarPublishJob | CalendarPromoteJob;
+
+export interface CalendarScheduleContext {
   contentStyle: ContentStyle;
   channel: string;
   threadTs: string;
@@ -136,14 +165,43 @@ function assertQstashConfigured(): void {
   }
 }
 
-/** Schedules a single calendar entry to fire (generate + send to Slack for confirmation) via QStash. */
-export async function scheduleCalendarEntry(runAt: number, job: CalendarPublishJob): Promise<void> {
+/**
+ * Schedules calendar posts via QStash. Entries within QStash's max delay are scheduled
+ * directly with their exact publish time; anything further out is bundled into a single
+ * "promote" job that re-runs this same logic later (see QSTASH_REQUEUE_SECONDS above).
+ */
+export async function scheduleCalendarEntries(pillars: CalendarPillar[], context: CalendarScheduleContext): Promise<void> {
   assertQstashConfigured();
   const qstash = new Client({ token: config.qstashToken });
+  const url = `${config.appBaseUrl}/api/calendar/publish`;
+  const nowSeconds = Math.floor(Date.now() / 1000);
 
-  await qstash.publishJSON({
-    url: `${config.appBaseUrl}/api/calendar/publish`,
-    body: job,
-    notBefore: runAt,
-  });
+  const dueSoon = pillars.filter((p) => p.scheduledAt - nowSeconds <= QSTASH_MAX_DELAY_SECONDS);
+  const later = pillars.filter((p) => p.scheduledAt - nowSeconds > QSTASH_MAX_DELAY_SECONDS);
+
+  await Promise.all(
+    dueSoon.map((p) => {
+      const job: CalendarPublishJob = {
+        type: "publish",
+        topic: p.prompt,
+        contentStyle: context.contentStyle,
+        channel: context.channel,
+        threadTs: context.threadTs,
+        requestedBy: context.requestedBy,
+      };
+      return qstash.publishJSON({ url, body: job, notBefore: p.scheduledAt });
+    })
+  );
+
+  if (later.length > 0) {
+    const job: CalendarPromoteJob = {
+      type: "promote",
+      contentStyle: context.contentStyle,
+      channel: context.channel,
+      threadTs: context.threadTs,
+      requestedBy: context.requestedBy,
+      remaining: later,
+    };
+    await qstash.publishJSON({ url, body: job, notBefore: nowSeconds + QSTASH_REQUEUE_SECONDS });
+  }
 }
