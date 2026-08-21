@@ -157,8 +157,9 @@ function calendarFormBlocks(pendingId: string) {
   ];
 }
 
-function calendarReviewBlocks(reviewId: string, summaryText: string) {
+function calendarReviewBlocks(reviewId: string, gridText: string, summaryText: string) {
   return [
+    { type: "section" as const, text: { type: "mrkdwn" as const, text: gridText } },
     { type: "section" as const, text: { type: "mrkdwn" as const, text: summaryText } },
     {
       type: "actions" as const,
@@ -172,17 +173,18 @@ function calendarReviewBlocks(reviewId: string, summaryText: string) {
   ];
 }
 
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
 // Renders an epoch-seconds timestamp back into the requester's local wall-clock time,
 // using the same fixed tz-offset trick as calendar.ts's scheduledDatesInWindow.
 function formatScheduledDate(epochSeconds: number, tzOffsetSeconds: number): string {
   const local = new Date((epochSeconds + tzOffsetSeconds) * 1000);
   const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const hours24 = local.getUTCHours();
   const minutes = local.getUTCMinutes().toString().padStart(2, "0");
   const hours12 = ((hours24 + 11) % 12) + 1;
   const ampm = hours24 < 12 ? "AM" : "PM";
-  return `${days[local.getUTCDay()]}, ${months[local.getUTCMonth()]} ${local.getUTCDate()} at ${hours12}:${minutes} ${ampm}`;
+  return `${days[local.getUTCDay()]}, ${MONTHS_SHORT[local.getUTCMonth()]} ${local.getUTCDate()} at ${hours12}:${minutes} ${ampm}`;
 }
 
 function calendarSummaryText(topic: string, contentStyle: ContentStyle, durationDays: number, pillars: CalendarPillar[], tzOffsetSeconds: number): string {
@@ -190,6 +192,45 @@ function calendarSummaryText(topic: string, contentStyle: ContentStyle, duration
   const durationLabel = CALENDAR_DURATIONS.find((d) => d.days === durationDays)?.label ?? `${durationDays}-day`;
   const lines = pillars.map((p, i) => `${i + 1}. *${formatScheduledDate(p.scheduledAt, tzOffsetSeconds)}* — ${p.pillar}`);
   return `*Content calendar: ${topic}* (${styleLabel}, ${durationLabel})\n\n${lines.join("\n")}\n\nApprove to schedule these ${pillars.length} posts — each will be generated and sent here for confirmation on its date.`;
+}
+
+// Renders a Mon-Sun text calendar grid (in a monospace code block) covering full weeks
+// from the earliest to latest scheduled post, with each post's pillar name in its date's
+// cell — a compact visual companion to the detailed list in calendarSummaryText.
+function calendarGridText(pillars: CalendarPillar[], tzOffsetSeconds: number): string {
+  const COL_WIDTH = 15;
+  const pad = (s: string, width: number) => (s.length > width ? s.slice(0, width - 1) + "…" : s.padEnd(width));
+  const toLocalDay = (epochSeconds: number) => {
+    const d = new Date((epochSeconds + tzOffsetSeconds) * 1000);
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  };
+  const mondayFirstDow = (d: Date) => (d.getUTCDay() + 6) % 7; // 0 = Monday .. 6 = Sunday
+  const dateKey = (d: Date) => `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+
+  const sorted = [...pillars].sort((a, b) => a.scheduledAt - b.scheduledAt);
+  const pillarByDate = new Map(sorted.map((p) => [dateKey(toLocalDay(p.scheduledAt)), p.pillar]));
+
+  const gridStart = toLocalDay(sorted[0].scheduledAt);
+  gridStart.setUTCDate(gridStart.getUTCDate() - mondayFirstDow(gridStart));
+  const gridEnd = toLocalDay(sorted[sorted.length - 1].scheduledAt);
+  gridEnd.setUTCDate(gridEnd.getUTCDate() + (6 - mondayFirstDow(gridEnd)));
+
+  const lines: string[] = [["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => pad(d, COL_WIDTH)).join("")];
+
+  for (const cursor = new Date(gridStart); cursor.getTime() <= gridEnd.getTime(); cursor.setUTCDate(cursor.getUTCDate() + 7)) {
+    const dateLine: string[] = [];
+    const pillarLine: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const day = new Date(cursor);
+      day.setUTCDate(day.getUTCDate() + i);
+      const pillar = pillarByDate.get(dateKey(day));
+      dateLine.push(pad(`${pillar ? "▸ " : "  "}${MONTHS_SHORT[day.getUTCMonth()]} ${day.getUTCDate()}`, COL_WIDTH));
+      pillarLine.push(pad(pillar ? `  ${pillar}` : "", COL_WIDTH));
+    }
+    lines.push(dateLine.join(""), pillarLine.join(""));
+  }
+
+  return "```\n" + lines.join("\n") + "\n```";
 }
 
 // ExpressReceiver over Slack's HTTP Events API + Interactivity, instead of Socket Mode —
@@ -348,7 +389,7 @@ async function handleGenerateCalendar(pendingId: string, values: any, channel: s
       channel,
       ts: messageTs,
       text: calendarSummaryText(pending.topic, contentStyle, durationDays, pillars, tzOffsetSeconds),
-      blocks: calendarReviewBlocks(reviewId, calendarSummaryText(pending.topic, contentStyle, durationDays, pillars, tzOffsetSeconds)),
+      blocks: calendarReviewBlocks(reviewId, calendarGridText(pillars, tzOffsetSeconds), calendarSummaryText(pending.topic, contentStyle, durationDays, pillars, tzOffsetSeconds)),
     });
   } catch (err: any) {
     console.error(err);
@@ -448,7 +489,7 @@ async function handleRegenerateCalendar(reviewId: string, channel: string, messa
       channel,
       ts: messageTs,
       text: calendarSummaryText(review.topic, review.contentStyle, review.durationDays, pillars, review.tzOffsetSeconds),
-      blocks: calendarReviewBlocks(reviewId, calendarSummaryText(review.topic, review.contentStyle, review.durationDays, pillars, review.tzOffsetSeconds)),
+      blocks: calendarReviewBlocks(reviewId, calendarGridText(pillars, review.tzOffsetSeconds), calendarSummaryText(review.topic, review.contentStyle, review.durationDays, pillars, review.tzOffsetSeconds)),
     });
   } catch (err: any) {
     console.error(err);
