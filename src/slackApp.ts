@@ -92,29 +92,48 @@ function regenerateBlocks(draftId: string) {
   ];
 }
 
+// Slack's `actions` block only supports buttons/overflow/checkboxes/radio/select-menus —
+// multi-select menus and timepickers are only valid as a `section` block's single
+// `accessory`, so each field gets its own section here; the submit button is the only
+// thing that actually goes in an `actions` block.
 function calendarFormBlocks(pendingId: string) {
   return [
     {
+      type: "section" as const,
+      block_id: "calendar_style_block",
+      text: { type: "mrkdwn" as const, text: "*Content style*" },
+      accessory: {
+        type: "static_select" as const,
+        action_id: "calendar_style_select",
+        placeholder: { type: "plain_text" as const, text: "Choose a style" },
+        options: CONTENT_STYLES.map((s) => ({ text: { type: "plain_text" as const, text: s.label }, value: s.style })),
+      },
+    },
+    {
+      type: "section" as const,
+      block_id: "calendar_weekday_block",
+      text: { type: "mrkdwn" as const, text: "*Days to post*" },
+      accessory: {
+        type: "multi_static_select" as const,
+        action_id: "calendar_weekday_select",
+        placeholder: { type: "plain_text" as const, text: "Choose days" },
+        options: WEEKDAYS.map((w) => ({ text: { type: "plain_text" as const, text: w.label }, value: w.value })),
+      },
+    },
+    {
+      type: "section" as const,
+      block_id: "calendar_time_block",
+      text: { type: "mrkdwn" as const, text: "*Time to post*" },
+      accessory: {
+        type: "timepicker" as const,
+        action_id: "calendar_time_picker",
+        placeholder: { type: "plain_text" as const, text: "Choose a time" },
+      },
+    },
+    {
       type: "actions" as const,
-      block_id: "calendar_schedule_form",
+      block_id: "calendar_generate_actions",
       elements: [
-        {
-          type: "static_select" as const,
-          action_id: "calendar_style_select",
-          placeholder: { type: "plain_text" as const, text: "Content style" },
-          options: CONTENT_STYLES.map((s) => ({ text: { type: "plain_text" as const, text: s.label }, value: s.style })),
-        },
-        {
-          type: "multi_static_select" as const,
-          action_id: "calendar_weekday_select",
-          placeholder: { type: "plain_text" as const, text: "Days to post" },
-          options: WEEKDAYS.map((w) => ({ text: { type: "plain_text" as const, text: w.label }, value: w.value })),
-        },
-        {
-          type: "timepicker" as const,
-          action_id: "calendar_time_picker",
-          placeholder: { type: "plain_text" as const, text: "Time" },
-        },
         {
           type: "button" as const,
           text: { type: "plain_text" as const, text: "📅 Generate Calendar" },
@@ -259,21 +278,23 @@ app.action("calendar_generate_submit", async ({ ack, body, client }) => {
   const pendingId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
-  const formValues = payload.state?.values?.calendar_schedule_form ?? {};
+  const values = payload.state?.values ?? {};
 
-  waitUntil(handleGenerateCalendar(pendingId, formValues, channel, messageTs, client));
+  waitUntil(handleGenerateCalendar(pendingId, values, channel, messageTs, client));
 });
 
-async function handleGenerateCalendar(pendingId: string, formValues: any, channel: string, messageTs: string, client: any) {
+async function handleGenerateCalendar(pendingId: string, values: any, channel: string, messageTs: string, client: any) {
   const pending = await getPendingRequest(pendingId);
   if (!pending) {
     await client.chat.update({ channel, ts: messageTs, text: "This request expired — ask me for a content calendar again.", blocks: [] });
     return;
   }
 
-  const contentStyle = formValues.calendar_style_select?.selected_option?.value as ContentStyle | undefined;
-  const weekdays: number[] = (formValues.calendar_weekday_select?.selected_options ?? []).map((o: any) => Number(o.value));
-  const timeHHMM = formValues.calendar_time_picker?.selected_time as string | undefined;
+  // Each field lives under its own block_id (section accessories, not one shared actions
+  // block), so state.values is keyed per-field rather than all under one block.
+  const contentStyle = values.calendar_style_block?.calendar_style_select?.selected_option?.value as ContentStyle | undefined;
+  const weekdays: number[] = (values.calendar_weekday_block?.calendar_weekday_select?.selected_options ?? []).map((o: any) => Number(o.value));
+  const timeHHMM = values.calendar_time_block?.calendar_time_picker?.selected_time as string | undefined;
 
   if (!contentStyle || weekdays.length === 0 || !timeHHMM) {
     await client.chat.postMessage({
