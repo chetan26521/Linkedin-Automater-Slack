@@ -26,10 +26,12 @@ Output format — read carefully:
 - Shape: [{"pillar": "<short pillar name>", "prompt": "<one-sentence writing prompt>"}, ...]`;
 
   const raw = await generateFromPrompt(prompt);
+  // Strip a markdown code fence if the model wrapped the JSON in one despite instructions.
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(cleaned);
   } catch {
     throw new Error(`Failed to parse content pillars — model returned non-JSON: ${raw.slice(0, 200)}`);
   }

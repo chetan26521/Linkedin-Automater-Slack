@@ -61,7 +61,9 @@ async function callAnthropic(prompt: string): Promise<string> {
     },
     body: JSON.stringify({
       model: config.anthropicModel,
-      max_tokens: 1024,
+      // Generous enough for a single post, and for a multi-pillar JSON calendar response
+      // (several pillars, each with a full sentence prompt) without truncating mid-output.
+      max_tokens: 4096,
       messages: [{ role: "user", content: prompt }],
     }),
   });
