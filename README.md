@@ -11,8 +11,8 @@ Say **"create a post: <topic>"** in a Slack channel the bot is in. It will:
 Say **"content calendar"** for a second flow that plans and schedules a whole series of posts:
 
 1. The bot asks what topic the calendar should be about — your *next message in the same thread* is treated as the answer (no need to repeat the trigger phrase).
-2. It then shows one message with a content-style dropdown, a multi-select for which weekdays to post on, and a time picker. Fill all three in and click **📅 Generate Calendar**.
-3. The bot breaks the topic into its natural content pillars (however many genuinely fit — typically 3–6) and proposes a schedule: one pillar per post, landing on the next occurrences of your chosen weekdays at your chosen time (computed in your own Slack timezone). Buttons: **✅ Approve & Schedule**, **🔄 Regenerate**, **🗑️ Dismiss**.
+2. It then shows a short form: a content-style dropdown, a multi-select for which weekdays to post on, a time picker, and a **Weekly (next 7 days)** / **Monthly (next 4 weeks)** length picker. Fill all four in and click **📅 Generate Calendar**.
+3. The weekday selection + length together decide exactly how many posts the calendar needs (e.g. Mon & Thu, Monthly → 8 slots), and the bot asks the model to plan precisely that many posts, organized under the topic's natural content pillars (grouping several posts under the same pillar with distinct angles when there are more slots than pillars) — so the calendar always comes out fully and evenly filled for the window you picked, never a mismatched or partial one. Buttons: **✅ Approve & Schedule**, **🔄 Regenerate**, **🗑️ Dismiss**.
 4. Approving schedules each post via [Upstash QStash](https://upstash.com/docs/qstash) to fire on its own date — nothing is generated yet. When a post's date arrives, it's generated automatically and sent to Slack with the exact same **✅ Post to LinkedIn** / **❌ Reject** flow as above; nothing publishes without that manual approval on the day.
 
 Requires QStash to be configured (see step 7) — without it, the calendar can be built and reviewed but Approve will fail to schedule anything.

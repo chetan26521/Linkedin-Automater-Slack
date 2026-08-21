@@ -109,6 +109,7 @@ export interface PendingCalendarReview {
   weekdays: number[]; // JS Date.getDay() numbering, 0 = Sunday
   timeHHMM: string;
   tzOffsetSeconds: number;
+  durationDays: number; // window (from CALENDAR_DURATIONS) the weekday slots were counted within
   pillars: CalendarPillar[];
   channel: string;
   threadTs: string;

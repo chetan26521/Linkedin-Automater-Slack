@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import { config } from "./config.js";
 import { generatePostText, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
-import { generateContentPillars, nextScheduledDates, scheduleCalendarEntry } from "./calendar.js";
+import { generateContentPillars, scheduledDatesInWindow, scheduleCalendarEntry, CALENDAR_DURATIONS } from "./calendar.js";
 import { publishPost } from "./linkedin.js";
 import {
   saveDraft,
@@ -131,6 +131,17 @@ function calendarFormBlocks(pendingId: string) {
       },
     },
     {
+      type: "section" as const,
+      block_id: "calendar_duration_block",
+      text: { type: "mrkdwn" as const, text: "*Calendar length*" },
+      accessory: {
+        type: "static_select" as const,
+        action_id: "calendar_duration_select",
+        placeholder: { type: "plain_text" as const, text: "Weekly or monthly?" },
+        options: CALENDAR_DURATIONS.map((d) => ({ text: { type: "plain_text" as const, text: d.label }, value: d.duration })),
+      },
+    },
+    {
       type: "actions" as const,
       block_id: "calendar_generate_actions",
       elements: [
@@ -162,7 +173,7 @@ function calendarReviewBlocks(reviewId: string, summaryText: string) {
 }
 
 // Renders an epoch-seconds timestamp back into the requester's local wall-clock time,
-// using the same fixed tz-offset trick as calendar.ts's nextScheduledDates.
+// using the same fixed tz-offset trick as calendar.ts's scheduledDatesInWindow.
 function formatScheduledDate(epochSeconds: number, tzOffsetSeconds: number): string {
   const local = new Date((epochSeconds + tzOffsetSeconds) * 1000);
   const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -174,10 +185,11 @@ function formatScheduledDate(epochSeconds: number, tzOffsetSeconds: number): str
   return `${days[local.getUTCDay()]}, ${months[local.getUTCMonth()]} ${local.getUTCDate()} at ${hours12}:${minutes} ${ampm}`;
 }
 
-function calendarSummaryText(topic: string, contentStyle: ContentStyle, pillars: CalendarPillar[], tzOffsetSeconds: number): string {
+function calendarSummaryText(topic: string, contentStyle: ContentStyle, durationDays: number, pillars: CalendarPillar[], tzOffsetSeconds: number): string {
   const styleLabel = CONTENT_STYLES.find((s) => s.style === contentStyle)?.label ?? contentStyle;
+  const durationLabel = CALENDAR_DURATIONS.find((d) => d.days === durationDays)?.label ?? `${durationDays}-day`;
   const lines = pillars.map((p, i) => `${i + 1}. *${formatScheduledDate(p.scheduledAt, tzOffsetSeconds)}* — ${p.pillar}`);
-  return `*Content calendar: ${topic}* (${styleLabel})\n\n${lines.join("\n")}\n\nApprove to schedule these ${pillars.length} posts — each will be generated and sent here for confirmation on its date.`;
+  return `*Content calendar: ${topic}* (${styleLabel}, ${durationLabel})\n\n${lines.join("\n")}\n\nApprove to schedule these ${pillars.length} posts — each will be generated and sent here for confirmation on its date.`;
 }
 
 // ExpressReceiver over Slack's HTTP Events API + Interactivity, instead of Socket Mode —
@@ -295,12 +307,14 @@ async function handleGenerateCalendar(pendingId: string, values: any, channel: s
   const contentStyle = values.calendar_style_block?.calendar_style_select?.selected_option?.value as ContentStyle | undefined;
   const weekdays: number[] = (values.calendar_weekday_block?.calendar_weekday_select?.selected_options ?? []).map((o: any) => Number(o.value));
   const timeHHMM = values.calendar_time_block?.calendar_time_picker?.selected_time as string | undefined;
+  const durationValue = values.calendar_duration_block?.calendar_duration_select?.selected_option?.value as string | undefined;
+  const durationDays = CALENDAR_DURATIONS.find((d) => d.duration === durationValue)?.days;
 
-  if (!contentStyle || weekdays.length === 0 || !timeHHMM) {
+  if (!contentStyle || weekdays.length === 0 || !timeHHMM || !durationDays) {
     await client.chat.postMessage({
       channel,
       thread_ts: pending.threadTs,
-      text: "Please pick a content style, at least one day, and a time, then click Generate Calendar again.",
+      text: "Please pick a content style, at least one day, a time, and weekly/monthly, then click Generate Calendar again.",
     });
     return;
   }
@@ -311,9 +325,7 @@ async function handleGenerateCalendar(pendingId: string, values: any, channel: s
     const userInfo = await client.users.info({ user: pending.requestedBy });
     const tzOffsetSeconds: number = userInfo.user?.tz_offset ?? 0;
 
-    const rawPillars = await generateContentPillars(pending.topic, contentStyle);
-    const dates = nextScheduledDates(weekdays, rawPillars.length, timeHHMM, tzOffsetSeconds);
-    const pillars: CalendarPillar[] = rawPillars.map((p, i) => ({ ...p, scheduledAt: dates[i] }));
+    const pillars = await buildCalendarPillars(pending.topic, contentStyle, weekdays, durationDays, timeHHMM, tzOffsetSeconds);
 
     const reviewId = randomUUID();
     await saveCalendarReview({
@@ -323,6 +335,7 @@ async function handleGenerateCalendar(pendingId: string, values: any, channel: s
       weekdays,
       timeHHMM,
       tzOffsetSeconds,
+      durationDays,
       pillars,
       channel,
       threadTs: pending.threadTs,
@@ -334,13 +347,32 @@ async function handleGenerateCalendar(pendingId: string, values: any, channel: s
     await client.chat.update({
       channel,
       ts: messageTs,
-      text: calendarSummaryText(pending.topic, contentStyle, pillars, tzOffsetSeconds),
-      blocks: calendarReviewBlocks(reviewId, calendarSummaryText(pending.topic, contentStyle, pillars, tzOffsetSeconds)),
+      text: calendarSummaryText(pending.topic, contentStyle, durationDays, pillars, tzOffsetSeconds),
+      blocks: calendarReviewBlocks(reviewId, calendarSummaryText(pending.topic, contentStyle, durationDays, pillars, tzOffsetSeconds)),
     });
   } catch (err: any) {
     console.error(err);
     await client.chat.update({ channel, ts: messageTs, text: `Something went wrong building the calendar: ${err.message}`, blocks: [] });
   }
+}
+
+// Computes the exact weekday slots within the chosen weekly/monthly window, then asks the
+// LLM for exactly that many posts — the schedule (not the model) decides the post count, so
+// the calendar always comes out fully and evenly filled for the window the user picked.
+async function buildCalendarPillars(
+  topic: string,
+  contentStyle: ContentStyle,
+  weekdays: number[],
+  durationDays: number,
+  timeHHMM: string,
+  tzOffsetSeconds: number
+): Promise<CalendarPillar[]> {
+  const dates = scheduledDatesInWindow(weekdays, durationDays, timeHHMM, tzOffsetSeconds);
+  const rawPillars = await generateContentPillars(topic, contentStyle, dates.length);
+  // Defensive: models don't always return the exact count asked for — pair up only what
+  // both arrays actually have rather than crashing on an index past either end.
+  const count = Math.min(rawPillars.length, dates.length);
+  return rawPillars.slice(0, count).map((p, i) => ({ ...p, scheduledAt: dates[i] }));
 }
 
 app.action("approve_calendar", async ({ ack, body, client }) => {
@@ -408,17 +440,15 @@ async function handleRegenerateCalendar(reviewId: string, channel: string, messa
   await client.chat.update({ channel, ts: messageTs, text: "Regenerating the calendar… :writing_hand:", blocks: [] });
 
   try {
-    const rawPillars = await generateContentPillars(review.topic, review.contentStyle);
-    const dates = nextScheduledDates(review.weekdays, rawPillars.length, review.timeHHMM, review.tzOffsetSeconds);
-    const pillars: CalendarPillar[] = rawPillars.map((p, i) => ({ ...p, scheduledAt: dates[i] }));
+    const pillars = await buildCalendarPillars(review.topic, review.contentStyle, review.weekdays, review.durationDays, review.timeHHMM, review.tzOffsetSeconds);
 
     await saveCalendarReview({ ...review, pillars });
 
     await client.chat.update({
       channel,
       ts: messageTs,
-      text: calendarSummaryText(review.topic, review.contentStyle, pillars, review.tzOffsetSeconds),
-      blocks: calendarReviewBlocks(reviewId, calendarSummaryText(review.topic, review.contentStyle, pillars, review.tzOffsetSeconds)),
+      text: calendarSummaryText(review.topic, review.contentStyle, review.durationDays, pillars, review.tzOffsetSeconds),
+      blocks: calendarReviewBlocks(reviewId, calendarSummaryText(review.topic, review.contentStyle, review.durationDays, pillars, review.tzOffsetSeconds)),
     });
   } catch (err: any) {
     console.error(err);

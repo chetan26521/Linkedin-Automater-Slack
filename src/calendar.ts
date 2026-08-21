@@ -7,23 +7,38 @@ export interface ContentPillar {
   prompt: string;
 }
 
-/** Breaks a topic into its natural content pillars — one LinkedIn post per pillar. */
-export async function generateContentPillars(topic: string, contentStyle: ContentStyle): Promise<ContentPillar[]> {
+export type CalendarDuration = "weekly" | "monthly";
+
+export const CALENDAR_DURATIONS: { duration: CalendarDuration; label: string; days: number }[] = [
+  { duration: "weekly", label: "Weekly (next 7 days)", days: 7 },
+  { duration: "monthly", label: "Monthly (next 4 weeks)", days: 28 },
+];
+
+/**
+ * Breaks a topic into content pillars and produces exactly `postCount` posts total — the
+ * count is dictated by how many weekday slots fall within the chosen weekly/monthly window
+ * (see scheduledDatesInWindow), not chosen independently by the model, so every scheduled
+ * slot gets a genuinely distinct post and the calendar comes out evenly filled.
+ */
+export async function generateContentPillars(topic: string, contentStyle: ContentStyle, postCount: number): Promise<ContentPillar[]> {
   const styleInstruction = CONTENT_STYLES.find((s) => s.style === contentStyle)?.instruction;
 
-  const prompt = `You are a LinkedIn content strategist planning a short content calendar.
+  const prompt = `You are a LinkedIn content strategist planning a content calendar.
 
 Topic: "${topic}"
 Content style for every post: ${styleInstruction}
 
-Identify the natural core content pillars (distinct, non-overlapping angles) for this topic —
-whatever number is genuinely natural for it, typically between 3 and 6. For each pillar, write
-a short pillar name and a one-sentence writing prompt describing what that specific post should
-cover (this prompt will be handed to a writer with no other context, so make it self-contained).
+You need to plan EXACTLY ${postCount} posts for this calendar. First identify the natural core
+content pillars (distinct, non-overlapping angles) for this topic — typically 3 to 6, whatever
+is genuinely natural for it. Then produce exactly ${postCount} posts total, each assigned to one
+of those pillars — reusing a pillar across multiple posts when ${postCount} is larger than the
+number of natural pillars, but always giving each post its own distinct, specific angle so posts
+sharing a pillar never feel repetitive.
 
 Output format — read carefully:
-- Respond with ONLY a JSON array, nothing else. No preamble, no markdown fences, no commentary.
-- Shape: [{"pillar": "<short pillar name>", "prompt": "<one-sentence writing prompt>"}, ...]`;
+- Respond with ONLY a JSON array of exactly ${postCount} objects, nothing else. No preamble, no
+  markdown fences, no commentary.
+- Shape: [{"pillar": "<short pillar name>", "prompt": "<one-sentence writing prompt, self-contained>"}, ...]`;
 
   const raw = await generateFromPrompt(prompt);
   // Strip a markdown code fence if the model wrapped the JSON in one despite instructions.
@@ -49,13 +64,13 @@ Output format — read carefully:
 }
 
 /**
- * Returns `count` future UTC epoch-second timestamps, one per pillar, landing on the next
- * occurrences of `weekdays` (JS Date.getDay() numbering) at `timeHHMM` in the timezone
- * implied by `tzOffsetSeconds` (captured once, at generation time — a fixed offset rather
- * than a full IANA-aware calculation, so a DST transition mid-calendar could drift by an
- * hour; an acceptable simplification for this internal tool).
+ * Returns every UTC epoch-second timestamp, in order, landing on the next occurrences of
+ * `weekdays` (JS Date.getDay() numbering) within the next `windowDays` days, at `timeHHMM`
+ * in the timezone implied by `tzOffsetSeconds` (captured once, at generation time — a fixed
+ * offset rather than a full IANA-aware calculation, so a DST transition mid-calendar could
+ * drift by an hour; an acceptable simplification for this internal tool).
  */
-export function nextScheduledDates(weekdays: number[], count: number, timeHHMM: string, tzOffsetSeconds: number, from: Date = new Date()): number[] {
+export function scheduledDatesInWindow(weekdays: number[], windowDays: number, timeHHMM: string, tzOffsetSeconds: number, from: Date = new Date()): number[] {
   if (weekdays.length === 0) throw new Error("At least one weekday must be selected.");
 
   const [hours, minutes] = timeHHMM.split(":").map(Number);
@@ -65,12 +80,16 @@ export function nextScheduledDates(weekdays: number[], count: number, timeHHMM: 
   const cursor = new Date(Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate()));
   cursor.setUTCDate(cursor.getUTCDate() + 1); // start looking from tomorrow, local time
 
-  while (results.length < count) {
+  for (let i = 0; i < windowDays; i++) {
     if (weekdays.includes(cursor.getUTCDay())) {
       const localSlot = Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), hours, minutes);
       results.push(Math.floor(localSlot / 1000) - tzOffsetSeconds);
     }
     cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  if (results.length === 0) {
+    throw new Error("No dates fall in the selected window — check your weekday selection.");
   }
 
   return results;
