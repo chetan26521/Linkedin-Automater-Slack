@@ -12,6 +12,7 @@ const TOPIC_ANSWER_TTL_SECONDS = 10 * 60; // shorter — waiting on a human to t
 export interface Draft {
   id: string;
   text: string;
+  sources: { url: string; title: string }[]; // web search citations used to write this draft, if any
   topic: string;
   threadContext?: string;
   contentStyle: ContentStyle;
@@ -32,10 +33,10 @@ export async function getDraft(id: string): Promise<Draft | undefined> {
   return draft ?? undefined;
 }
 
-export async function updateDraftText(id: string, text: string): Promise<void> {
+export async function updateDraftText(id: string, text: string, sources: { url: string; title: string }[]): Promise<void> {
   const draft = await getDraft(id);
   if (!draft) return;
-  await saveDraft({ ...draft, text });
+  await saveDraft({ ...draft, text, sources });
 }
 
 export async function deleteDraft(id: string): Promise<void> {

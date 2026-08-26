@@ -2,6 +2,11 @@ import { config } from "./config.js";
 
 export interface GeneratedPost {
   postText: string;
+  // Web search citations actually used while researching the post — only ever populated
+  // when LLM_PROVIDER=anthropic (the only provider wired up for search here) and Claude
+  // decided a search was warranted. Empty otherwise, including when it answered from its
+  // own trained knowledge without searching.
+  sources: { url: string; title: string }[];
 }
 
 export type ContentStyle = "simple" | "technical" | "architectural" | "business";
@@ -78,6 +83,58 @@ async function callAnthropic(prompt: string): Promise<string> {
   return raw;
 }
 
+// Caps Claude's web searches per post generation — searches are billed per-use on top of
+// normal token costs ($10/1,000 searches as of writing), so this keeps cost bounded and
+// predictable rather than letting Claude research indefinitely.
+const MAX_WEB_SEARCHES_PER_POST = 5;
+
+interface AnthropicTextBlock {
+  type: "text";
+  text: string;
+  citations?: { type: string; url?: string; title?: string }[];
+}
+
+// Like callAnthropic, but with the server-side web_search tool enabled so Claude can
+// research the topic (including community/social discussion, where it judges that
+// relevant) before writing, and cites what it actually used. Only used for post text —
+// content-calendar pillar planning doesn't need live research.
+async function callAnthropicWithSearch(prompt: string): Promise<{ text: string; sources: { url: string; title: string }[] }> {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": config.anthropicApiKey,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: config.anthropicModel,
+      max_tokens: 4096,
+      messages: [{ role: "user", content: prompt }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: MAX_WEB_SEARCHES_PER_POST }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Anthropic API failed: ${response.status} ${await response.text()}`);
+  }
+
+  const json = (await response.json()) as { content?: Array<AnthropicTextBlock | { type: string }> };
+  const textBlocks = (json.content ?? []).filter((b): b is AnthropicTextBlock => b.type === "text");
+  const text = textBlocks.map((b) => b.text).join("").trim();
+  if (!text) throw new Error("Anthropic returned no content — try again shortly.");
+
+  const sourcesByUrl = new Map<string, string>();
+  for (const block of textBlocks) {
+    for (const citation of block.citations ?? []) {
+      if (citation.type === "web_search_result_location" && citation.url) {
+        sourcesByUrl.set(citation.url, citation.title ?? citation.url);
+      }
+    }
+  }
+
+  return { text, sources: [...sourcesByUrl].map(([url, title]) => ({ url, title })) };
+}
+
 // Dispatches a raw prompt to whichever LLM provider is configured. Shared by post
 // drafting and content-calendar pillar generation, so the 3-provider switch lives once.
 export async function generateFromPrompt(prompt: string): Promise<string> {
@@ -103,6 +160,13 @@ ${threadContext ? `\nAdditional context from the Slack thread:\n${threadContext}
 
 Content style: ${styleInstruction}
 
+Before writing, research the topic (if you have web search available) so the post reflects
+current, accurate information rather than relying solely on what you already know — look for
+credible sources, and where genuinely relevant, how the topic is actually being discussed by
+practitioners and the community (industry write-ups, Reddit threads, posts from recognized
+voices in the space). Use your judgment on what's relevant; don't force sources that don't fit
+just to have used search.
+
 Rules for the post:
 - Strong hook in the first line.
 - Short paragraphs, plain language, sounds like a real person (not corporate marketing copy).
@@ -119,7 +183,14 @@ Output format — read carefully:
 - Do not include any preamble, explanation, or introduction (e.g. "Here's the draft:", "Here's a polished version...").
 - Do not include closing remarks or questions (e.g. "Let me know if you'd like changes.").
 - Do not use separators like "---", headings, or wrap the post in quotes or code fences.
+- Do not include URLs, footnote markers, or citation text inline in the post itself — sources
+  are tracked and shown separately, not part of the published post body.
 - The first character of your response must be the first character of the post itself, and the last character must be the end of the post (its final word or hashtag).`;
 
-  return { postText: await generateFromPrompt(prompt) };
+  if (config.llmProvider === "anthropic") {
+    const { text, sources } = await callAnthropicWithSearch(prompt);
+    return { postText: text, sources };
+  }
+
+  return { postText: await generateFromPrompt(prompt), sources: [] };
 }

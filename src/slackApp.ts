@@ -565,6 +565,15 @@ app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, ac
   waitUntil(handleStyleSelected(contentStyle, pendingId, channel, messageTs, client));
 });
 
+// Renders web search citations (see GeneratedPost.sources in postWriter.ts) as a Slack
+// mrkdwn block appended below the draft text — "" when empty (no search used, or a
+// provider other than Anthropic, the only one wired up for search here).
+function formatSourcesBlock(sources: { url: string; title: string }[]): string {
+  if (sources.length === 0) return "";
+  const lines = sources.map((s) => `• <${s.url}|${s.title}>`);
+  return `\n\n*Sources used:*\n${lines.join("\n")}`;
+}
+
 // Generates a post, saves it as a Draft, and posts both the draft text and the
 // approve/reject buttons to Slack. Shared by the interactive "create a post" flow and
 // the QStash-triggered content-calendar publish webhook (api/calendar/publish.ts).
@@ -573,18 +582,19 @@ export async function createDraftAndPostConfirmation(
   params: { topic: string; contentStyle: ContentStyle; threadContext?: string; channel: string; threadTs: string; requestedBy: string }
 ): Promise<void> {
   const { topic, contentStyle, threadContext, channel, threadTs, requestedBy } = params;
-  const { postText } = await generatePostText(topic, contentStyle, threadContext);
+  const { postText, sources } = await generatePostText(topic, contentStyle, threadContext);
 
   const draftId = randomUUID();
   const draftMessage = await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
-    text: `*Draft LinkedIn post:*\n\n${postText}`,
+    text: `*Draft LinkedIn post:*\n\n${postText}${formatSourcesBlock(sources)}`,
   });
 
   await saveDraft({
     id: draftId,
     text: postText,
+    sources,
     topic,
     threadContext,
     contentStyle,
@@ -705,10 +715,10 @@ async function handleRegenerate(style: RefinementStyle, draftId: string, channel
   await client.chat.update({ channel, ts: messageTs, text: "Regenerating… :writing_hand:", blocks: [] });
 
   try {
-    const { postText } = await generatePostText(draft.topic, draft.contentStyle, draft.threadContext, { style, previousText: draft.text });
-    await updateDraftText(draftId, postText);
+    const { postText, sources } = await generatePostText(draft.topic, draft.contentStyle, draft.threadContext, { style, previousText: draft.text });
+    await updateDraftText(draftId, postText, sources);
 
-    await client.chat.update({ channel, ts: draft.messageTs, text: `*Draft LinkedIn post:*\n\n${postText}` });
+    await client.chat.update({ channel, ts: draft.messageTs, text: `*Draft LinkedIn post:*\n\n${postText}${formatSourcesBlock(sources)}` });
     await client.chat.update({ channel, ts: messageTs, text: "Post the above to LinkedIn?", blocks: confirmBlocks(draftId) });
   } catch (err: any) {
     console.error(err);
