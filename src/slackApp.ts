@@ -555,7 +555,7 @@ function formatPublishedDate(epochMs: number): string {
   return `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCDate()}`;
 }
 
-function editPostPickerBlocks(posts: PublishedPost[]) {
+function editPostPickerBlocks(threadTs: string, posts: PublishedPost[]) {
   return [
     {
       type: "section" as const,
@@ -566,9 +566,12 @@ function editPostPickerBlocks(posts: PublishedPost[]) {
         action_id: "edit_post_select",
         placeholder: { type: "plain_text" as const, text: "Choose a post" },
         // plain_text option labels are capped at 75 chars by Slack — leave room for the date prefix.
+        // The thread's own root ts is encoded into the value (not re-derived later from
+        // payload.message.thread_ts) — that field isn't reliably present on every message,
+        // so relying on it silently breaks the "reply to answer" step further down the flow.
         options: posts.map((p) => ({
           text: { type: "plain_text" as const, text: `${formatPublishedDate(p.publishedAt)} · ${truncateForOption(p.text, 60)}` },
-          value: p.urn,
+          value: `${threadTs}|${p.urn}`,
         })),
       },
     },
@@ -603,7 +606,7 @@ async function handleEditTrigger(msg: any, client: any) {
       channel: msg.channel,
       thread_ts: threadTs,
       text: "Which post would you like to edit?",
-      blocks: editPostPickerBlocks(posts),
+      blocks: editPostPickerBlocks(threadTs, posts),
     });
   } catch (err: any) {
     console.error(err);
@@ -614,10 +617,9 @@ async function handleEditTrigger(msg: any, client: any) {
 app.action("edit_post_select", async ({ ack, body, client }) => {
   await ack();
   const payload = body as any;
-  const urn = payload.actions[0].selected_option.value as string;
+  const [threadTs, urn] = (payload.actions[0].selected_option.value as string).split("|");
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
-  const threadTs = (payload.message.thread_ts ?? payload.message.ts) as string;
   const requestedBy = payload.user.id as string;
 
   waitUntil(handleEditPostSelected(urn, channel, messageTs, threadTs, requestedBy, client));
