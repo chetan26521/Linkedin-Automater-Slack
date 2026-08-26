@@ -97,7 +97,7 @@ Drafts and pending style requests are stored in Redis (not in memory), since a s
 5. Go back to your Slack app's **Event Subscriptions** and **Interactivity** settings (step 3) and set both Request URLs to `https://your-app.vercel.app/api/slack/events`, now that it's live. Slack will verify the URL on save.
 6. For local dev, pull the same values with `vercel env pull .env.development.local` (after `vercel link`), or copy them manually into `.env` from step 1. To let Slack reach your machine for local testing, tunnel it (e.g. `ngrok http 3000`) and temporarily point the Slack Request URLs at the tunnel's `/api/slack/events` instead.
 
-The `maxDuration` for the function is set to 60s in [vercel.json](vercel.json) — LLM generation and LinkedIn publishing can both take a few seconds, and this needs enough headroom to not get cut off mid-request. Increase it if you're on a plan that allows longer, or if a slower model needs more room.
+The `maxDuration` for both functions is set to 300s (5 minutes) in [vercel.json](vercel.json) — the maximum Vercel allows even on the free Hobby plan. LLM generation with web search enabled can take a while (multiple search round-trips before Claude finishes writing), and this needs enough headroom to not get silently cut off mid-request — a `waitUntil()`-wrapped promise that hits `maxDuration` is hard-cancelled, not a catchable error, so there'd be no error message in Slack either, just silence.
 
 ## 7. Set up QStash (only needed for "content calendar")
 

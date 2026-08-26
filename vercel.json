@@ -2,10 +2,10 @@
   "buildCommand": "",
   "functions": {
     "api/slack/events.ts": {
-      "maxDuration": 60
+      "maxDuration": 300
     },
     "api/calendar/publish.ts": {
-      "maxDuration": 60
+      "maxDuration": 300
     }
   }
 }

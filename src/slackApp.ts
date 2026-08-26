@@ -578,8 +578,12 @@ function editPostPickerBlocks(threadTs: string, posts: PublishedPost[]) {
   ];
 }
 
-function postEditReviewBlocks(reviewId: string) {
+// When a message has `blocks`, Slack renders those as the body and the `text` param becomes
+// only a fallback for notifications/screen readers — it's never shown. The proposed text
+// has to be its own section block, not just passed as `text` alongside the buttons.
+function postEditReviewBlocks(reviewId: string, summaryText: string) {
   return [
+    { type: "section" as const, text: { type: "mrkdwn" as const, text: summaryText } },
     {
       type: "actions" as const,
       block_id: "post_edit_review_actions",
@@ -663,11 +667,12 @@ async function handlePostEditFeedbackProvided(awaiting: AwaitingPostEditFeedback
       createdAt: Date.now(),
     });
 
+    const summaryText = `*Proposed update:*\n\n${postText}${formatSourcesBlock(sources)}`;
     await client.chat.postMessage({
       channel: awaiting.channel,
       thread_ts: awaiting.threadTs,
-      text: `*Proposed update:*\n\n${postText}${formatSourcesBlock(sources)}`,
-      blocks: postEditReviewBlocks(reviewId),
+      text: summaryText,
+      blocks: postEditReviewBlocks(reviewId, summaryText),
     });
   } catch (err: any) {
     console.error(err);
