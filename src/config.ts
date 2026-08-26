@@ -49,6 +49,7 @@ export const config = {
   linkedinClientSecret: process.env.LINKEDIN_CLIENT_SECRET ?? "",
   triggerPhrase: process.env.TRIGGER_PHRASE ?? "create a post",
   calendarTriggerPhrase: process.env.CALENDAR_TRIGGER_PHRASE ?? "content calendar",
+  editTriggerPhrase: process.env.EDIT_TRIGGER_PHRASE ?? "edit post",
   // Content calendar scheduling (Upstash QStash) — optional; only needed once someone
   // actually approves a calendar. See assertQstashConfigured() in src/calendar.ts.
   qstashToken: process.env.QSTASH_TOKEN ?? "",

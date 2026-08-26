@@ -132,3 +132,80 @@ export async function getCalendarReview(id: string): Promise<PendingCalendarRevi
 export async function deleteCalendarReview(id: string): Promise<void> {
   await redis.del(calendarReviewKey(id));
 }
+
+// Bounded history of posts published through this bot, most-recent-first — real history,
+// not transient state, so it's a plain Redis list rather than a TTL'd key. Editing a post
+// re-pushes the updated entry rather than mutating the old one in place; the freshest
+// version naturally sorts first and the stale duplicate ages out of the bounded list.
+export interface PublishedPost {
+  urn: string;
+  text: string;
+  publishedAt: number;
+}
+
+const PUBLISHED_POSTS_KEY = "published-posts";
+const MAX_PUBLISHED_POSTS_HISTORY = 20;
+
+export async function recordPublishedPost(post: PublishedPost): Promise<void> {
+  await redis.lpush(PUBLISHED_POSTS_KEY, post);
+  await redis.ltrim(PUBLISHED_POSTS_KEY, 0, MAX_PUBLISHED_POSTS_HISTORY - 1);
+}
+
+export async function listPublishedPosts(limit: number): Promise<PublishedPost[]> {
+  return redis.lrange<PublishedPost>(PUBLISHED_POSTS_KEY, 0, limit - 1);
+}
+
+// Holds an "edit post" selection until the user's next message answers "what would you
+// like to change?" — same channel+thread keying as AwaitingCalendarTopic, for the same
+// reason (a plain text reply can't carry an id).
+export interface AwaitingPostEditFeedback {
+  channel: string;
+  threadTs: string;
+  requestedBy: string;
+  urn: string;
+  previousText: string;
+  createdAt: number;
+}
+
+const awaitingPostEditKey = (channel: string, threadTs: string) => `awaiting-post-edit:${channel}:${threadTs}`;
+
+export async function saveAwaitingPostEditFeedback(entry: AwaitingPostEditFeedback): Promise<void> {
+  await redis.set(awaitingPostEditKey(entry.channel, entry.threadTs), entry, { ex: TOPIC_ANSWER_TTL_SECONDS });
+}
+
+export async function getAwaitingPostEditFeedback(channel: string, threadTs: string): Promise<AwaitingPostEditFeedback | undefined> {
+  const entry = await redis.get<AwaitingPostEditFeedback>(awaitingPostEditKey(channel, threadTs));
+  return entry ?? undefined;
+}
+
+export async function deleteAwaitingPostEditFeedback(channel: string, threadTs: string): Promise<void> {
+  await redis.del(awaitingPostEditKey(channel, threadTs));
+}
+
+// A proposed rewrite of an already-published post, awaiting apply/revise-again/cancel.
+export interface PendingPostEditReview {
+  id: string;
+  urn: string;
+  previousText: string;
+  proposedText: string;
+  sources: { url: string; title: string }[];
+  channel: string;
+  threadTs: string;
+  requestedBy: string;
+  createdAt: number;
+}
+
+const postEditReviewKey = (id: string) => `post-edit-review:${id}`;
+
+export async function savePostEditReview(review: PendingPostEditReview): Promise<void> {
+  await redis.set(postEditReviewKey(review.id), review, { ex: TTL_SECONDS });
+}
+
+export async function getPostEditReview(id: string): Promise<PendingPostEditReview | undefined> {
+  const review = await redis.get<PendingPostEditReview>(postEditReviewKey(id));
+  return review ?? undefined;
+}
+
+export async function deletePostEditReview(id: string): Promise<void> {
+  await redis.del(postEditReviewKey(id));
+}

@@ -9,21 +9,21 @@ export interface GeneratedPost {
   sources: { url: string; title: string }[];
 }
 
-export type ContentStyle = "simple" | "technical" | "architectural" | "business";
+export type ContentStyle = "thought-leadership" | "industry-insight" | "case-study" | "announcement";
 
 export const CONTENT_STYLES: { style: ContentStyle; label: string; instruction: string }[] = [
-  { style: "simple", label: "🧩 Simple", instruction: "Write for a general audience: plain everyday language, no jargon, focused on the big-picture takeaway and why it matters." },
-  { style: "technical", label: "⚙️ Technical", instruction: "Write for a technical/engineering audience: be specific about the technology, implementation details, and tradeoffs involved." },
-  { style: "architectural", label: "🏗️ Architectural", instruction: "Write for an audience interested in system design: focus on architecture, design decisions, scalability, and how the pieces fit together." },
-  { style: "business", label: "💼 Business", instruction: "Write for a business/leadership audience: focus on impact, ROI, strategic value, and outcomes rather than technical detail." },
+  { style: "thought-leadership", label: "💡 Thought Leadership", instruction: "Write as a thought-leadership piece: share a clear point of view or original perspective on the topic, positioning the author as someone worth listening to in this space." },
+  { style: "industry-insight", label: "📊 Industry Insight", instruction: "Write as an industry insight or analysis: surface a notable trend, pattern, or data point in the space and explain what it actually means for people working in it." },
+  { style: "case-study", label: "🎯 Case Study", instruction: "Write as a case study or concrete example: walk through a specific real-world scenario, result, or lesson learned, grounded in specifics rather than generalities." },
+  { style: "announcement", label: "📢 Announcement", instruction: "Write as an announcement or update: clearly state what's new or changed and why it matters to the audience, without overselling it." },
 ];
 
-export type RefinementStyle = "shorter" | "professional" | "punchier" | "different-angle";
+export type RefinementStyle = "concise" | "formal" | "data-driven" | "different-angle";
 
 export const REFINEMENT_STYLES: { style: RefinementStyle; label: string; instruction: string }[] = [
-  { style: "shorter", label: "📏 Shorter", instruction: "Make it noticeably shorter and more concise while keeping the core message." },
-  { style: "professional", label: "👔 More Professional", instruction: "Make the tone more professional and polished, and less casual." },
-  { style: "punchier", label: "🔥 Punchier", instruction: "Make it punchier and more attention-grabbing, with a stronger hook and more energy." },
+  { style: "concise", label: "📐 More Concise", instruction: "Make it noticeably shorter and more concise while keeping the core message." },
+  { style: "formal", label: "🎩 More Formal", instruction: "Make the tone more formal and polished — precise language, no slang or casual asides, reads like it was written by a senior professional." },
+  { style: "data-driven", label: "📊 More Data-Driven", instruction: "Strengthen the post with more concrete specifics — data points, examples, or evidence — rather than general claims." },
   { style: "different-angle", label: "🔀 Different Angle", instruction: "Take a completely different angle or structure than the previous draft, while staying on the same topic." },
 ];
 
@@ -31,6 +31,25 @@ export interface Refinement {
   style: RefinementStyle;
   previousText: string;
 }
+
+// Shared by generatePostText and revisePublishedPost, so a formatting rule only needs to be
+// stated once. The anti-em-dash/slash rule exists because those read as an unmistakable
+// "AI wrote this" tell — LLMs default to them far more than natural human writing does.
+const POST_FORMAT_RULES = `Rules for the post:
+- Strong hook in the first line.
+- Short paragraphs, plain language, sounds like a real person (not corporate marketing copy).
+- Write in complete, natural sentences — do not use em dashes, en dashes, or hyphens as a rhetorical pause or clause separator (e.g. avoid "the results were clear - and surprising"). Do not use backslashes or forward slashes as shorthand connectors (e.g. "and/or", "input/output") — spell things out in plain words instead.
+- 0-3 relevant hashtags max, only at the very end.
+- 80-200 words.
+
+Output format — read carefully:
+- Respond with ONLY the finished post text, exactly as it should be published.
+- Do not include any preamble, explanation, or introduction (e.g. "Here's the draft:", "Here's a polished version...").
+- Do not include closing remarks or questions (e.g. "Let me know if you'd like changes.").
+- Do not use separators like "---", headings, or wrap the post in quotes or code fences.
+- Do not include URLs, footnote markers, or citation text inline in the post itself — sources
+  are tracked and shown separately, not part of the published post body.
+- The first character of your response must be the first character of the post itself, and the last character must be the end of the post (its final word or hashtag).`;
 
 // OpenRouter and OpenAI both speak the same chat-completions request/response shape.
 async function callOpenAiCompatible(url: string, apiKey: string, model: string, prompt: string, providerLabel: string): Promise<string> {
@@ -167,25 +186,40 @@ practitioners and the community (industry write-ups, Reddit threads, posts from 
 voices in the space). Use your judgment on what's relevant; don't force sources that don't fit
 just to have used search.
 
-Rules for the post:
-- Strong hook in the first line.
-- Short paragraphs, plain language, sounds like a real person (not corporate marketing copy).
-- 0-3 relevant hashtags max, only at the very end.
-- 80-200 words.
+${POST_FORMAT_RULES}
 ${
   refinement
     ? `\nYou previously wrote this draft, which the user rejected:\n"""\n${refinement.previousText}\n"""\nRevise it based on this feedback: ${refinementInstruction}\nDo not just tweak a few words — meaningfully rewrite the post while still following all the rules above.`
     : ""
+}`;
+
+  if (config.llmProvider === "anthropic") {
+    const { text, sources } = await callAnthropicWithSearch(prompt);
+    return { postText: text, sources };
+  }
+
+  return { postText: await generateFromPrompt(prompt), sources: [] };
 }
 
-Output format — read carefully:
-- Respond with ONLY the finished post text, exactly as it should be published.
-- Do not include any preamble, explanation, or introduction (e.g. "Here's the draft:", "Here's a polished version...").
-- Do not include closing remarks or questions (e.g. "Let me know if you'd like changes.").
-- Do not use separators like "---", headings, or wrap the post in quotes or code fences.
-- Do not include URLs, footnote markers, or citation text inline in the post itself — sources
-  are tracked and shown separately, not part of the published post body.
-- The first character of your response must be the first character of the post itself, and the last character must be the end of the post (its final word or hashtag).`;
+/**
+ * Revises the text of an already-published LinkedIn post based on freeform user feedback
+ * (the "edit post" flow) — distinct from generatePostText's refinement path, which revises
+ * an unpublished draft against one of the fixed RefinementStyle options.
+ */
+export async function revisePublishedPost(previousText: string, instruction: string): Promise<GeneratedPost> {
+  const prompt = `You are revising a LinkedIn post that has ALREADY BEEN PUBLISHED, based on specific feedback from its author.
+
+Current published post:
+"""
+${previousText}
+"""
+
+Requested change: ${instruction}
+
+Rewrite the post to address this feedback. Keep it recognizably the same post (same core topic
+and message) unless the feedback explicitly asks for a different angle.
+
+${POST_FORMAT_RULES}`;
 
   if (config.llmProvider === "anthropic") {
     const { text, sources } = await callAnthropicWithSearch(prompt);

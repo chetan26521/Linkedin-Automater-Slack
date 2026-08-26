@@ -65,3 +65,14 @@ export async function publishPost(text: string): Promise<string> {
 
   return response.headers.get("x-restli-id") ?? response.headers.get("x-linkedin-id") ?? "unknown";
 }
+
+/** Updates the text of an already-published post via LinkedIn's PARTIAL_UPDATE. */
+export async function updatePost(urn: string, text: string): Promise<void> {
+  assertConfigured();
+
+  await linkedinFetch(`/rest/posts/${encodeURIComponent(urn)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-RestLi-Method": "PARTIAL_UPDATE" },
+    body: JSON.stringify({ patch: { $set: { commentary: escapeLittleText(text) } } }),
+  });
+}

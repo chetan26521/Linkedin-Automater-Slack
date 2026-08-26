@@ -2,11 +2,11 @@
 
 Say **"create a post: <topic>"** in a Slack channel the bot is in. It will:
 
-1. Ask how the post should be written: **🧩 Simple**, **⚙️ Technical**, **🏗️ Architectural**, or **💼 Business**.
-2. Draft LinkedIn post copy in that style with your configured LLM provider ([OpenRouter](https://openrouter.ai), OpenAI, or Anthropic), based on your message (and thread, if replying in one). When `LLM_PROVIDER=anthropic`, Claude researches the topic first using its web search tool (up to 5 searches per post, including community/social discussion where relevant — Reddit, industry write-ups, etc., at its own judgment) before writing, and the draft message lists the sources it actually cited. Not available on the other providers; if Claude judges a search unnecessary for the topic, no sources are shown either.
+1. Ask how the post should be written: **💡 Thought Leadership**, **📊 Industry Insight**, **🎯 Case Study**, or **📢 Announcement**.
+2. Draft LinkedIn post copy in that style with your configured LLM provider ([OpenRouter](https://openrouter.ai), OpenAI, or Anthropic), based on your message (and thread, if replying in one). When `LLM_PROVIDER=anthropic`, Claude researches the topic first using its web search tool (up to 5 searches per post, including community/social discussion where relevant — Reddit, industry write-ups, etc., at its own judgment) before writing, and the draft message lists the sources it actually cited. Not available on the other providers; if Claude judges a search unnecessary for the topic, no sources are shown either. The prompt also steers away from em-dash-as-pause and slash-as-shorthand patterns that read as obviously AI-written.
 3. Post the exact draft text back to Slack with **✅ Post to LinkedIn** / **❌ Reject** buttons.
 4. Only publish to your LinkedIn profile if you click **Post to LinkedIn**. Ignoring it entirely means nothing is ever posted (both the pending style request and any draft expire after 30 minutes).
-5. Clicking **❌ Reject** doesn't discard anything yet — it shows a follow-up: **📏 Shorter**, **👔 More Professional**, **🔥 Punchier**, **🔀 Different Angle**, or **🗑️ Dismiss**. Picking a style regenerates the post (same topic/thread context/content style, revised per that feedback) and shows the Post/Reject buttons again — you can loop through as many regenerations as you like. **Dismiss** is the only action that actually throws the draft away.
+5. Clicking **❌ Reject** doesn't discard anything yet — it shows a follow-up: **📐 More Concise**, **🎩 More Formal**, **📊 More Data-Driven**, **🔀 Different Angle**, or **🗑️ Dismiss**. Picking a style regenerates the post (same topic/thread context/content style, revised per that feedback) and shows the Post/Reject buttons again — you can loop through as many regenerations as you like. **Dismiss** is the only action that actually throws the draft away.
 
 Say **"content calendar"** for a second flow that plans and schedules a whole series of posts:
 
@@ -17,7 +17,16 @@ Say **"content calendar"** for a second flow that plans and schedules a whole se
 
 Requires QStash to be configured (see step 7) — without it, the calendar can be built and reviewed but Approve will fail to schedule anything.
 
-No message without "create a post" or "content calendar" in it does anything — the bot ignores all other channel chatter.
+Say **"edit post"** to revise something already published:
+
+1. The bot lists your last 10 published posts (date + preview) in a dropdown — pick one.
+2. It asks what you'd like to change — your *next message in the same thread* is treated as the answer, same pattern as the calendar's "what topic?" step.
+3. The AI rewrites the post based on your feedback and shows the proposed new text with **✅ Apply Update**, **🔄 Revise Again**, or **🗑️ Cancel**. **Revise Again** loops back to step 2, continuing from the latest proposal rather than the original, so successive rounds of feedback compound.
+4. Only **Apply Update** actually changes the live LinkedIn post, via LinkedIn's partial-update API — nothing changes until you click it.
+
+The bot remembers your last 20 published posts (including ones it scheduled via the content calendar) for this picker; older ones age out.
+
+No message without "create a post", "content calendar", or "edit post" in it does anything — the bot ignores all other channel chatter.
 
 ## 1. Install dependencies
 
@@ -107,14 +116,14 @@ If you skip this step, "create a post" works exactly as before; "content calenda
 npm run dev
 ```
 
-Then in Slack: `create a post: we just shipped X, here's why it matters`, or `content calendar` to plan a series.
+Then in Slack: `create a post: we just shipped X, here's why it matters`, `content calendar` to plan a series, or `edit post` to revise something already published.
 
 ## Notes / things to check before relying on this
 
 - LinkedIn bumps its API version string monthly (`LINKEDIN_VERSION` in [src/linkedin.ts](src/linkedin.ts)). If publishing starts failing with a version-related error, check LinkedIn's current version at https://learn.microsoft.com/en-us/linkedin/marketing/versioning and update it.
-- Pending style requests and drafts (text only) live in Redis with a 30-minute TTL, keyed by an id on the Slack buttons. If you never click through, they just expire — you'd ask it to create the post again.
+- Pending style requests and drafts (text only) live in Redis with a 30-minute TTL, keyed by an id on the Slack buttons. If you never click through, they just expire — you'd ask it to create the post again. Published-post history is different: it's a plain bounded list (last 20), not TTL'd, since it's real history rather than transient in-flight state.
 - This is scoped to your personal LinkedIn profile (`w_member_social`). Posting to a company Page needs the `w_organization_social` scope and admin access to that Page, which isn't wired up here.
-- The trigger phrases are `"create a post"` and `"content calendar"` (case-insensitive substring match), configurable via `TRIGGER_PHRASE` / `CALENDAR_TRIGGER_PHRASE` in `.env`.
+- The trigger phrases are `"create a post"`, `"content calendar"`, and `"edit post"` (case-insensitive substring match), configurable via `TRIGGER_PHRASE` / `CALENDAR_TRIGGER_PHRASE` / `EDIT_TRIGGER_PHRASE` in `.env`.
 - OpenRouter's free models can be lower quality than paid ones and occasionally get rate-limited or rotated out (see step 2). Switching `LLM_PROVIDER` to `openai` or `anthropic` is a config-only change — no code edits needed.
 - Every Slack button click acks immediately, then does the slow work (LLM call, LinkedIn publish) wrapped in `waitUntil()` from `@vercel/functions` ([src/slackApp.ts](src/slackApp.ts)) — this is required on Vercel because a serverless function's execution environment can otherwise be frozen right after the HTTP response is sent, silently killing any work still in flight.
 - A generated calendar's schedule math ([src/calendar.ts](src/calendar.ts)) uses a fixed timezone offset captured once (from the requester's Slack profile) rather than a full IANA-aware calculation — a daylight-saving transition partway through a multi-week calendar could shift a post by an hour. Not worth a timezone library for this internal tool, but worth knowing.

@@ -2,9 +2,9 @@ import Bolt from "@slack/bolt";
 import { randomUUID } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import { config } from "./config.js";
-import { generatePostText, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
+import { generatePostText, revisePublishedPost, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
 import { generateContentPillars, scheduledDatesInWindow, scheduleCalendarEntries, CALENDAR_DURATIONS } from "./calendar.js";
-import { publishPost } from "./linkedin.js";
+import { publishPost, updatePost } from "./linkedin.js";
 import {
   saveDraft,
   getDraft,
@@ -19,8 +19,18 @@ import {
   saveCalendarReview,
   getCalendarReview,
   deleteCalendarReview,
+  recordPublishedPost,
+  listPublishedPosts,
+  saveAwaitingPostEditFeedback,
+  getAwaitingPostEditFeedback,
+  deleteAwaitingPostEditFeedback,
+  savePostEditReview,
+  getPostEditReview,
+  deletePostEditReview,
   type AwaitingCalendarTopic,
   type CalendarPillar,
+  type PublishedPost,
+  type AwaitingPostEditFeedback,
 } from "./store.js";
 
 const { App, ExpressReceiver } = Bolt;
@@ -29,6 +39,8 @@ const { App, ExpressReceiver } = Bolt;
 const TRIGGER = new RegExp(config.triggerPhrase, "i");
 // Matches "content calendar" anywhere in the message, case-insensitive.
 const CALENDAR_TRIGGER = new RegExp(config.calendarTriggerPhrase, "i");
+// Matches "edit post" anywhere in the message, case-insensitive.
+const EDIT_TRIGGER = new RegExp(config.editTriggerPhrase, "i");
 // Strips a leading connector word left behind after the trigger phrase, e.g.
 // "create a post on Zoho IoT" -> topic "Zoho IoT" instead of "on Zoho IoT".
 const LEADING_CONNECTOR = /^(on|about|regarding|for)\s+/i;
@@ -265,19 +277,31 @@ app.message(async ({ message, client }) => {
   waitUntil(routeMessage(msg, client));
 });
 
-// Checked in priority order: a fresh "content calendar" trigger, then whether this message
-// is the answer to a pending "what topic?" question, then the existing "create a post" flow.
+// Checked in priority order: fresh "content calendar" / "edit post" triggers, then whether
+// this message answers a pending question from either of those flows, then "create a post".
 async function routeMessage(msg: any, client: any) {
   if (CALENDAR_TRIGGER.test(msg.text)) {
     await handleCalendarTrigger(msg, client);
     return;
   }
 
+  if (EDIT_TRIGGER.test(msg.text)) {
+    await handleEditTrigger(msg, client);
+    return;
+  }
+
   if (msg.thread_ts) {
-    const awaiting = await getAwaitingCalendarTopic(msg.channel, msg.thread_ts);
-    if (awaiting && awaiting.requestedBy === msg.user) {
+    const awaitingTopic = await getAwaitingCalendarTopic(msg.channel, msg.thread_ts);
+    if (awaitingTopic && awaitingTopic.requestedBy === msg.user) {
       await deleteAwaitingCalendarTopic(msg.channel, msg.thread_ts);
-      await handleCalendarTopicProvided(awaiting, msg.text, client);
+      await handleCalendarTopicProvided(awaitingTopic, msg.text, client);
+      return;
+    }
+
+    const awaitingEdit = await getAwaitingPostEditFeedback(msg.channel, msg.thread_ts);
+    if (awaitingEdit && awaitingEdit.requestedBy === msg.user) {
+      await deleteAwaitingPostEditFeedback(msg.channel, msg.thread_ts);
+      await handlePostEditFeedbackProvided(awaitingEdit, msg.text, client);
       return;
     }
   }
@@ -517,6 +541,215 @@ async function handleDismissCalendar(reviewId: string, channel: string, messageT
   await client.chat.update({ channel, ts: messageTs, text: "🗑️ Calendar discarded — nothing was scheduled.", blocks: [] });
 }
 
+// ---- Edit an already-published post ----
+
+const EDIT_POST_PICKER_LIMIT = 10; // how many recent posts to offer, out of the full history
+
+function truncateForOption(text: string, maxLength: number): string {
+  const singleLine = text.replace(/\s+/g, " ").trim();
+  return singleLine.length > maxLength ? `${singleLine.slice(0, maxLength - 1)}…` : singleLine;
+}
+
+function formatPublishedDate(epochMs: number): string {
+  const d = new Date(epochMs);
+  return `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+
+function editPostPickerBlocks(posts: PublishedPost[]) {
+  return [
+    {
+      type: "section" as const,
+      block_id: "edit_post_picker",
+      text: { type: "mrkdwn" as const, text: "Which post would you like to edit?" },
+      accessory: {
+        type: "static_select" as const,
+        action_id: "edit_post_select",
+        placeholder: { type: "plain_text" as const, text: "Choose a post" },
+        // plain_text option labels are capped at 75 chars by Slack — leave room for the date prefix.
+        options: posts.map((p) => ({
+          text: { type: "plain_text" as const, text: `${formatPublishedDate(p.publishedAt)} · ${truncateForOption(p.text, 60)}` },
+          value: p.urn,
+        })),
+      },
+    },
+  ];
+}
+
+function postEditReviewBlocks(reviewId: string) {
+  return [
+    {
+      type: "actions" as const,
+      block_id: "post_edit_review_actions",
+      elements: [
+        { type: "button" as const, text: { type: "plain_text" as const, text: "✅ Apply Update" }, style: "primary" as const, action_id: "apply_post_edit", value: reviewId },
+        { type: "button" as const, text: { type: "plain_text" as const, text: "🔄 Revise Again" }, action_id: "revise_post_edit_again", value: reviewId },
+        { type: "button" as const, text: { type: "plain_text" as const, text: "🗑️ Cancel" }, style: "danger" as const, action_id: "cancel_post_edit", value: reviewId },
+      ],
+    },
+  ];
+}
+
+async function handleEditTrigger(msg: any, client: any) {
+  const threadTs = msg.thread_ts || msg.ts;
+
+  try {
+    const posts = await listPublishedPosts(EDIT_POST_PICKER_LIMIT);
+    if (posts.length === 0) {
+      await client.chat.postMessage({ channel: msg.channel, thread_ts: threadTs, text: "No published posts found — nothing's been posted through me yet." });
+      return;
+    }
+
+    await client.chat.postMessage({
+      channel: msg.channel,
+      thread_ts: threadTs,
+      text: "Which post would you like to edit?",
+      blocks: editPostPickerBlocks(posts),
+    });
+  } catch (err: any) {
+    console.error(err);
+    await client.chat.postMessage({ channel: msg.channel, thread_ts: threadTs, text: `Something went wrong: ${err.message}` });
+  }
+}
+
+app.action("edit_post_select", async ({ ack, body, client }) => {
+  await ack();
+  const payload = body as any;
+  const urn = payload.actions[0].selected_option.value as string;
+  const channel = payload.channel.id as string;
+  const messageTs = payload.message.ts as string;
+  const threadTs = (payload.message.thread_ts ?? payload.message.ts) as string;
+  const requestedBy = payload.user.id as string;
+
+  waitUntil(handleEditPostSelected(urn, channel, messageTs, threadTs, requestedBy, client));
+});
+
+async function handleEditPostSelected(urn: string, channel: string, messageTs: string, threadTs: string, requestedBy: string, client: any) {
+  try {
+    const posts = await listPublishedPosts(EDIT_POST_PICKER_LIMIT);
+    const post = posts.find((p) => p.urn === urn);
+    if (!post) {
+      await client.chat.update({ channel, ts: messageTs, text: "That post is no longer in the recent history — ask me to edit a post again.", blocks: [] });
+      return;
+    }
+
+    await saveAwaitingPostEditFeedback({ channel, threadTs, requestedBy, urn, previousText: post.text, createdAt: Date.now() });
+
+    await client.chat.update({ channel, ts: messageTs, text: `Selected: "${truncateForOption(post.text, 80)}"`, blocks: [] });
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: "What would you like to change about this post? Reply in this thread." });
+  } catch (err: any) {
+    console.error(err);
+    await client.chat.update({ channel, ts: messageTs, text: `Something went wrong: ${err.message}`, blocks: [] });
+  }
+}
+
+async function handlePostEditFeedbackProvided(awaiting: AwaitingPostEditFeedback, instruction: string, client: any) {
+  try {
+    await client.chat.postMessage({ channel: awaiting.channel, thread_ts: awaiting.threadTs, text: "Revising… :writing_hand:" });
+
+    const { postText, sources } = await revisePublishedPost(awaiting.previousText, instruction);
+
+    const reviewId = randomUUID();
+    await savePostEditReview({
+      id: reviewId,
+      urn: awaiting.urn,
+      previousText: awaiting.previousText,
+      proposedText: postText,
+      sources,
+      channel: awaiting.channel,
+      threadTs: awaiting.threadTs,
+      requestedBy: awaiting.requestedBy,
+      createdAt: Date.now(),
+    });
+
+    await client.chat.postMessage({
+      channel: awaiting.channel,
+      thread_ts: awaiting.threadTs,
+      text: `*Proposed update:*\n\n${postText}${formatSourcesBlock(sources)}`,
+      blocks: postEditReviewBlocks(reviewId),
+    });
+  } catch (err: any) {
+    console.error(err);
+    await client.chat.postMessage({ channel: awaiting.channel, thread_ts: awaiting.threadTs, text: `Something went wrong revising the post: ${err.message}` });
+  }
+}
+
+app.action("apply_post_edit", async ({ ack, body, client }) => {
+  await ack();
+  const payload = body as any;
+  const reviewId = payload.actions[0].value as string;
+  const channel = payload.channel.id as string;
+  const messageTs = payload.message.ts as string;
+
+  waitUntil(handleApplyPostEdit(reviewId, channel, messageTs, client));
+});
+
+async function handleApplyPostEdit(reviewId: string, channel: string, messageTs: string, client: any) {
+  const review = await getPostEditReview(reviewId);
+  if (!review) {
+    await client.chat.update({ channel, ts: messageTs, text: "This edit expired — ask me to edit a post again.", blocks: [] });
+    return;
+  }
+
+  await client.chat.update({ channel, ts: messageTs, text: "Updating the live post…", blocks: [] });
+
+  try {
+    await updatePost(review.urn, review.proposedText);
+    await recordPublishedPost({ urn: review.urn, text: review.proposedText, publishedAt: Date.now() });
+    await deletePostEditReview(reviewId);
+
+    await client.chat.update({ channel, ts: messageTs, text: "✅ Post updated on LinkedIn.", blocks: [] });
+  } catch (err: any) {
+    console.error(err);
+    await client.chat.update({ channel, ts: messageTs, text: `❌ Failed to update the post: ${err.message}`, blocks: [] });
+  }
+}
+
+app.action("revise_post_edit_again", async ({ ack, body, client }) => {
+  await ack();
+  const payload = body as any;
+  const reviewId = payload.actions[0].value as string;
+  const channel = payload.channel.id as string;
+  const messageTs = payload.message.ts as string;
+
+  waitUntil(handleRevisePostEditAgain(reviewId, channel, messageTs, client));
+});
+
+async function handleRevisePostEditAgain(reviewId: string, channel: string, messageTs: string, client: any) {
+  const review = await getPostEditReview(reviewId);
+  if (!review) {
+    await client.chat.update({ channel, ts: messageTs, text: "This edit expired — ask me to edit a post again.", blocks: [] });
+    return;
+  }
+
+  await client.chat.update({ channel, ts: messageTs, text: "What would you like to change this time? Reply in this thread.", blocks: [] });
+
+  // Continue from the latest proposal, not the original, so successive revisions compound.
+  await saveAwaitingPostEditFeedback({
+    channel: review.channel,
+    threadTs: review.threadTs,
+    requestedBy: review.requestedBy,
+    urn: review.urn,
+    previousText: review.proposedText,
+    createdAt: Date.now(),
+  });
+  await deletePostEditReview(reviewId);
+}
+
+app.action("cancel_post_edit", async ({ ack, body, client }) => {
+  await ack();
+  const payload = body as any;
+  const reviewId = payload.actions[0].value as string;
+  const channel = payload.channel.id as string;
+  const messageTs = payload.message.ts as string;
+
+  waitUntil(handleCancelPostEdit(reviewId, channel, messageTs, client));
+});
+
+async function handleCancelPostEdit(reviewId: string, channel: string, messageTs: string, client: any) {
+  await deletePostEditReview(reviewId);
+  await client.chat.update({ channel, ts: messageTs, text: "🗑️ Edit cancelled — the live post was not changed.", blocks: [] });
+}
+
 async function handleTrigger(msg: any, client: any) {
   const topic = msg.text.replace(TRIGGER, "").trim().replace(LEADING_CONNECTOR, "").trim() || msg.text;
   const threadTs = msg.thread_ts || msg.ts;
@@ -554,7 +787,7 @@ async function handleTrigger(msg: any, client: any) {
   }
 }
 
-app.action(/^style_(simple|technical|architectural|business)$/, async ({ ack, action, body, client }) => {
+app.action(/^style_(thought-leadership|industry-insight|case-study|announcement)$/, async ({ ack, action, body, client }) => {
   await ack();
   const contentStyle = (action as any).action_id.replace("style_", "") as ContentStyle;
   const payload = body as any;
@@ -660,7 +893,8 @@ async function handleApprove(draftId: string, channel: string, messageTs: string
   await client.chat.update({ channel, ts: messageTs, text: "Posting to LinkedIn…", blocks: [] });
 
   try {
-    await publishPost(draft.text);
+    const urn = await publishPost(draft.text);
+    await recordPublishedPost({ urn, text: draft.text, publishedAt: Date.now() });
     await deleteDraft(draftId);
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: "✅ Posted to LinkedIn." });
   } catch (err: any) {
@@ -694,7 +928,7 @@ async function handleReject(draftId: string, channel: string, messageTs: string,
   });
 }
 
-app.action(/^regenerate_(shorter|professional|punchier|different-angle)$/, async ({ ack, action, body, client }) => {
+app.action(/^regenerate_(concise|formal|data-driven|different-angle)$/, async ({ ack, action, body, client }) => {
   await ack();
   const style = (action as any).action_id.replace("regenerate_", "") as RefinementStyle;
   const payload = body as any;
