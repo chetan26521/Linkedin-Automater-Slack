@@ -9,15 +9,26 @@ const redis = new Redis({ url: config.redisUrl, token: config.redisToken });
 const TTL_SECONDS = 30 * 60; // entries expire 30 min after creation if never resolved
 const TOPIC_ANSWER_TTL_SECONDS = 10 * 60; // shorter — waiting on a human to type a reply
 
+// A poster that has already been uploaded to LinkedIn and is waiting on approval. Only the
+// URN is kept, never the image bytes — Redis is sized for small values, and the bytes serve
+// no further purpose once LinkedIn is holding them.
+export interface DraftImage {
+  urn: string;
+  altText: string;
+  headline: string;
+}
+
 export interface Draft {
   id: string;
   text: string;
   sources: { url: string; title: string }[]; // web search citations used to write this draft, if any
+  image?: DraftImage; // absent when poster generation is off, or failed and wasn't retried
   topic: string;
   threadContext?: string;
   contentStyle: ContentStyle;
   messageTs: string; // ts of the Slack message showing the draft text, so regenerate can edit it in place
   channel: string;
+  threadTs: string; // root of the Slack thread, so a redesigned poster can be posted back into it
   requestedBy: string;
   createdAt: number;
 }
@@ -37,6 +48,12 @@ export async function updateDraftText(id: string, text: string, sources: { url: 
   const draft = await getDraft(id);
   if (!draft) return;
   await saveDraft({ ...draft, text, sources });
+}
+
+export async function updateDraftImage(id: string, image: DraftImage | undefined): Promise<void> {
+  const draft = await getDraft(id);
+  if (!draft) return;
+  await saveDraft({ ...draft, image });
 }
 
 export async function deleteDraft(id: string): Promise<void> {

@@ -1,6 +1,6 @@
 import { Client } from "@upstash/qstash";
 import { config } from "./config.js";
-import { generateFromPrompt, CONTENT_STYLES, type ContentStyle } from "./postWriter.js";
+import { generateFromPrompt, parseJsonFromModel, CONTENT_STYLES, type ContentStyle } from "./postWriter.js";
 import type { CalendarPillar } from "./store.js";
 
 export interface ContentPillar {
@@ -44,16 +44,7 @@ Output format — read carefully:
   fixed-width text calendar grid, where those break column alignment). "prompt" has no such
   restriction.`;
 
-  const raw = await generateFromPrompt(prompt);
-  // Strip a markdown code fence if the model wrapped the JSON in one despite instructions.
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    throw new Error(`Failed to parse content pillars — model returned non-JSON: ${raw.slice(0, 200)}`);
-  }
+  const parsed = parseJsonFromModel<unknown>(await generateFromPrompt(prompt), "content pillars");
 
   if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new Error("Model returned no content pillars.");

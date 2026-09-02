@@ -3,9 +3,9 @@ import { config } from "./config.js";
 export interface GeneratedPost {
   postText: string;
   // Web search citations actually used while researching the post — only ever populated
-  // when LLM_PROVIDER=anthropic (the only provider wired up for search here) and Claude
-  // decided a search was warranted. Empty otherwise, including when it answered from its
-  // own trained knowledge without searching.
+  // for the providers with a server-side search tool wired up here (anthropic, gemini) and
+  // only when the model decided a search was warranted. Empty otherwise, including when it
+  // answered from its own trained knowledge without searching.
   sources: { url: string; title: string }[];
 }
 
@@ -154,16 +154,108 @@ async function callAnthropicWithSearch(prompt: string): Promise<{ text: string; 
   return { text, sources: [...sourcesByUrl].map(([url, title]) => ({ url, title })) };
 }
 
+// ---- Gemini ----
+
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+
+interface GeminiCandidate {
+  content?: { parts?: { text?: string }[] };
+  finishReason?: string;
+  groundingMetadata?: { groundingChunks?: { web?: { uri?: string; title?: string } }[] };
+}
+
+/**
+ * Gemini's generateContent, with the server-side Google Search tool optional so the
+ * grounded and plain paths share one set of request/error handling. Gemini 2.5+ models
+ * spend part of their output budget on internal reasoning tokens, so maxOutputTokens is
+ * deliberately left unset — capping it is exactly what produces an empty response with
+ * finishReason MAX_TOKENS.
+ */
+async function callGemini(prompt: string, options: { search?: boolean } = {}): Promise<{ text: string; sources: { url: string; title: string }[] }> {
+  const response = await fetch(`${GEMINI_API_BASE}/${config.geminiModel}:generateContent`, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": config.geminiApiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      ...(options.search ? { tools: [{ google_search: {} }] } : {}),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gemini API failed: ${response.status} ${await response.text()}`);
+  }
+
+  const json = (await response.json()) as { candidates?: GeminiCandidate[]; promptFeedback?: { blockReason?: string } };
+  if (json.promptFeedback?.blockReason) {
+    throw new Error(`Gemini declined the request (${json.promptFeedback.blockReason}) — try rewording the topic.`);
+  }
+
+  const candidate = json.candidates?.[0];
+  const text = (candidate?.content?.parts ?? []).map((p) => p.text ?? "").join("").trim();
+  if (!text) {
+    throw new Error(`Gemini returned no content (finish reason: ${candidate?.finishReason ?? "unknown"}) — try again shortly.`);
+  }
+
+  // Grounding citations come back as redirect URLs on Google's grounding-api-redirect host,
+  // titled with the source's domain. They resolve to the real page and render fine in Slack,
+  // so they're passed through as-is rather than followed to their destination here.
+  const sourcesByUrl = new Map<string, string>();
+  for (const chunk of candidate?.groundingMetadata?.groundingChunks ?? []) {
+    if (chunk.web?.uri) sourcesByUrl.set(chunk.web.uri, chunk.web.title ?? chunk.web.uri);
+  }
+
+  return { text, sources: [...sourcesByUrl].map(([url, title]) => ({ url, title })) };
+}
+
+/**
+ * Parses a JSON payload out of a model response, tolerating the markdown code fence models
+ * tend to add despite being told not to. Shared by the content-calendar planner and the
+ * poster art-direction brief.
+ */
+export function parseJsonFromModel<T>(raw: string, what: string): T {
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    throw new Error(`Failed to parse ${what} — model returned non-JSON: ${raw.slice(0, 200)}`);
+  }
+}
+
 // Dispatches a raw prompt to whichever LLM provider is configured. Shared by post
-// drafting and content-calendar pillar generation, so the 3-provider switch lives once.
+// drafting, content-calendar pillar generation, and the poster art brief, so the provider
+// switch lives in one place.
 export async function generateFromPrompt(prompt: string): Promise<string> {
   switch (config.llmProvider) {
     case "openai":
       return callOpenAiCompatible("https://api.openai.com/v1/chat/completions", config.openaiApiKey, config.openaiModel, prompt, "OpenAI");
     case "anthropic":
       return callAnthropic(prompt);
+    case "gemini":
+      return (await callGemini(prompt)).text;
     default:
       return callOpenAiCompatible("https://openrouter.ai/api/v1/chat/completions", config.openrouterApiKey, config.openrouterModel, prompt, "OpenRouter");
+  }
+}
+
+// Runs a post-writing prompt through the configured provider, using its server-side web
+// search tool where one is wired up so the post reflects current information and can cite
+// what it used. Providers without search fall back to writing from trained knowledge alone,
+// which yields no sources — see GeneratedPost.sources.
+async function generateGroundedPost(prompt: string): Promise<GeneratedPost> {
+  switch (config.llmProvider) {
+    case "anthropic": {
+      const { text, sources } = await callAnthropicWithSearch(prompt);
+      return { postText: text, sources };
+    }
+    case "gemini": {
+      const { text, sources } = await callGemini(prompt, { search: true });
+      return { postText: text, sources };
+    }
+    default:
+      return { postText: await generateFromPrompt(prompt), sources: [] };
   }
 }
 
@@ -193,12 +285,7 @@ ${
     : ""
 }`;
 
-  if (config.llmProvider === "anthropic") {
-    const { text, sources } = await callAnthropicWithSearch(prompt);
-    return { postText: text, sources };
-  }
-
-  return { postText: await generateFromPrompt(prompt), sources: [] };
+  return generateGroundedPost(prompt);
 }
 
 /**
@@ -221,10 +308,5 @@ and message) unless the feedback explicitly asks for a different angle.
 
 ${POST_FORMAT_RULES}`;
 
-  if (config.llmProvider === "anthropic") {
-    const { text, sources } = await callAnthropicWithSearch(prompt);
-    return { postText: text, sources };
-  }
-
-  return { postText: await generateFromPrompt(prompt), sources: [] };
+  return generateGroundedPost(prompt);
 }

@@ -4,11 +4,13 @@ import { waitUntil } from "@vercel/functions";
 import { config } from "./config.js";
 import { generatePostText, revisePublishedPost, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
 import { generateContentPillars, scheduledDatesInWindow, scheduleCalendarEntries, CALENDAR_DURATIONS } from "./calendar.js";
-import { publishPost, updatePost } from "./linkedin.js";
+import { publishPost, updatePost, uploadImage } from "./linkedin.js";
+import { generatePostImage, type PostImage } from "./imageGen.js";
 import {
   saveDraft,
   getDraft,
   updateDraftText,
+  updateDraftImage,
   deleteDraft,
   savePendingRequest,
   getPendingRequest,
@@ -31,6 +33,7 @@ import {
   type CalendarPillar,
   type PublishedPost,
   type AwaitingPostEditFeedback,
+  type DraftImage,
 } from "./store.js";
 
 const { App, ExpressReceiver } = Bolt;
@@ -71,14 +74,33 @@ function styleBlocks(pendingId: string) {
   ];
 }
 
-function confirmBlocks(draftId: string) {
+// Kept next to confirmBlocks so the rendered section text and the `text` notification
+// fallback passed alongside it can't drift apart.
+function confirmPromptText(hasImage: boolean, imageError?: string): string {
+  // A failed *retry* keeps the poster the draft already had, so that case has to read
+  // differently from a first attempt that produced nothing at all.
+  if (imageError && hasImage) return `⚠️ Couldn't design a new poster: ${imageError}\n\nThe previous poster is still attached — post it as-is, try again, or go text-only?`;
+  if (imageError) return `⚠️ Couldn't design a poster: ${imageError}\n\nPost the text on its own, or try the poster again?`;
+  if (hasImage) return "Post the text above, with this poster, to LinkedIn?";
+  return "Post the above to LinkedIn?";
+}
+
+function confirmBlocks(draftId: string, hasImage: boolean, imageError?: string) {
   return [
-    { type: "section" as const, text: { type: "mrkdwn" as const, text: "Post the above to LinkedIn?" } },
+    { type: "section" as const, text: { type: "mrkdwn" as const, text: confirmPromptText(hasImage, imageError) } },
     {
       type: "actions" as const,
       block_id: "linkedin_confirm",
       elements: [
-        { type: "button" as const, text: { type: "plain_text" as const, text: "✅ Post to LinkedIn" }, style: "primary" as const, action_id: "approve_post", value: draftId },
+        { type: "button" as const, text: { type: "plain_text" as const, text: hasImage ? "✅ Post with Poster" : "✅ Post to LinkedIn" }, style: "primary" as const, action_id: "approve_post", value: draftId },
+        // Offered whenever posters are switched on at all, not just when one exists, so a
+        // failed generation can be retried instead of leaving text-only as the only way out.
+        ...(config.postImages
+          ? [{ type: "button" as const, text: { type: "plain_text" as const, text: hasImage ? "🖼️ New Poster" : "🖼️ Design a Poster" }, action_id: "regenerate_image", value: draftId }]
+          : []),
+        ...(hasImage
+          ? [{ type: "button" as const, text: { type: "plain_text" as const, text: "📄 Text Only" }, action_id: "approve_post_text_only", value: draftId }]
+          : []),
         { type: "button" as const, text: { type: "plain_text" as const, text: "❌ Reject" }, style: "danger" as const, action_id: "reject_post", value: draftId },
       ],
     },
@@ -814,9 +836,46 @@ function formatSourcesBlock(sources: { url: string; title: string }[]): string {
   return `\n\n*Sources used:*\n${lines.join("\n")}`;
 }
 
-// Generates a post, saves it as a Draft, and posts both the draft text and the
-// approve/reject buttons to Slack. Shared by the interactive "create a post" flow and
-// the QStash-triggered content-calendar publish webhook (api/calendar/publish.ts).
+// Slack can only render an image in a thread from bytes it holds itself, so the poster is
+// uploaded to Slack as a file. That needs the files:write scope — and since a poster the
+// reviewer can't see is still a perfectly valid poster, a failure here is reported in the
+// thread rather than allowed to fail the draft.
+async function previewPosterInSlack(client: any, poster: PostImage, channel: string, threadTs: string): Promise<void> {
+  try {
+    await client.files.uploadV2({
+      channel_id: channel,
+      thread_ts: threadTs,
+      file: poster.bytes,
+      filename: `linkedin-poster.${poster.mimeType === "image/jpeg" ? "jpg" : "png"}`,
+      title: poster.headline,
+      initial_comment: `*Poster:* ${poster.headline}\n_Alt text:_ ${poster.altText}`,
+    });
+  } catch (err: any) {
+    console.error("Failed to preview the poster in Slack:", err);
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: `🖼️ Poster designed ("${poster.headline}") but it couldn't be previewed here: ${err.message}\nAdd the *files:write* scope to the Slack app to see posters before they go out.`,
+    });
+  }
+}
+
+// Designs a poster for a draft, uploads it to LinkedIn immediately, and previews it in the
+// Slack thread. Uploading now rather than at publish time means the image bytes never have
+// to be parked anywhere between serverless invocations — the draft carries only the
+// resulting image URN, and whoever approves it is approving the exact image that goes out.
+// An uploaded image that never gets attached to a post is simply an unused asset.
+async function designPosterForDraft(client: any, postText: string, topic: string, channel: string, threadTs: string): Promise<DraftImage> {
+  const poster = await generatePostImage(postText, topic);
+  const urn = await uploadImage(poster.bytes, poster.mimeType);
+  await previewPosterInSlack(client, poster, channel, threadTs);
+  return { urn, altText: poster.altText, headline: poster.headline };
+}
+
+// Generates a post and its poster, saves both as a Draft, and posts the draft text, the
+// poster preview, and the approve/reject buttons to Slack. Shared by the interactive
+// "create a post" flow and the QStash-triggered content-calendar publish webhook
+// (api/calendar/publish.ts).
 export async function createDraftAndPostConfirmation(
   client: any,
   params: { topic: string; contentStyle: ContentStyle; threadContext?: string; channel: string; threadTs: string; requestedBy: string }
@@ -831,15 +890,30 @@ export async function createDraftAndPostConfirmation(
     text: `*Draft LinkedIn post:*\n\n${postText}${formatSourcesBlock(sources)}`,
   });
 
+  // A poster failing to generate must not cost the finished post text, so the failure is
+  // surfaced on the confirmation step (which offers a retry button) rather than thrown.
+  let image: DraftImage | undefined;
+  let imageError: string | undefined;
+  if (config.postImages) {
+    try {
+      image = await designPosterForDraft(client, postText, topic, channel, threadTs);
+    } catch (err: any) {
+      console.error("Poster generation failed:", err);
+      imageError = err.message;
+    }
+  }
+
   await saveDraft({
     id: draftId,
     text: postText,
     sources,
+    image,
     topic,
     threadContext,
     contentStyle,
     messageTs: draftMessage.ts as string,
     channel,
+    threadTs,
     requestedBy,
     createdAt: Date.now(),
   });
@@ -847,8 +921,8 @@ export async function createDraftAndPostConfirmation(
   await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
-    text: "Post the above to LinkedIn?",
-    blocks: confirmBlocks(draftId),
+    text: confirmPromptText(!!image, imageError),
+    blocks: confirmBlocks(draftId, !!image, imageError),
   });
 }
 
@@ -880,34 +954,81 @@ async function handleStyleSelected(contentStyle: ContentStyle, pendingId: string
   }
 }
 
-app.action("approve_post", async ({ ack, body, client }) => {
+// One handler for both approve buttons — "Text Only" is the same publish with the draft's
+// poster left off, not a separate flow.
+app.action(/^approve_post(_text_only)?$/, async ({ ack, action, body, client }) => {
   await ack();
+  const textOnly = (action as any).action_id === "approve_post_text_only";
   const payload = body as any;
   const draftId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
 
-  waitUntil(handleApprove(draftId, channel, messageTs, client));
+  waitUntil(handleApprove(draftId, channel, messageTs, client, textOnly));
 });
 
-async function handleApprove(draftId: string, channel: string, messageTs: string, client: any) {
+async function handleApprove(draftId: string, channel: string, messageTs: string, client: any, textOnly: boolean) {
   const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: "This draft expired — ask me to create a post again." });
     return;
   }
 
-  await client.chat.update({ channel, ts: messageTs, text: "Posting to LinkedIn…", blocks: [] });
+  const image = textOnly ? undefined : draft.image;
+  await client.chat.update({ channel, ts: messageTs, text: image ? "Posting to LinkedIn with the poster…" : "Posting to LinkedIn…", blocks: [] });
 
   try {
-    const urn = await publishPost(draft.text);
+    const urn = await publishPost(draft.text, image);
     await recordPublishedPost({ urn, text: draft.text, publishedAt: Date.now() });
     await deleteDraft(draftId);
-    await client.chat.postMessage({ channel, thread_ts: messageTs, text: "✅ Posted to LinkedIn." });
+    await client.chat.postMessage({ channel, thread_ts: messageTs, text: image ? "✅ Posted to LinkedIn with the poster." : "✅ Posted to LinkedIn." });
   } catch (err: any) {
     console.error(err);
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: `❌ Failed to post to LinkedIn: ${err.message}` });
   }
+}
+
+app.action("regenerate_image", async ({ ack, body, client }) => {
+  await ack();
+  const payload = body as any;
+  const draftId = payload.actions[0].value as string;
+  const channel = payload.channel.id as string;
+  const messageTs = payload.message.ts as string;
+
+  waitUntil(handleRegenerateImage(draftId, channel, messageTs, client));
+});
+
+// Designs a replacement poster for an unchanged draft. Earlier previews are deliberately
+// left in the thread rather than deleted, so the reviewer can compare attempts and pick by
+// clicking approve under whichever confirmation message they prefer.
+async function handleRegenerateImage(draftId: string, channel: string, messageTs: string, client: any) {
+  const draft = await getDraft(draftId);
+  if (!draft) {
+    await client.chat.update({ channel, ts: messageTs, text: "This draft expired — ask me to create a post again.", blocks: [] });
+    return;
+  }
+
+  await client.chat.update({ channel, ts: messageTs, text: "Designing a new poster… :art:", blocks: [] });
+
+  let image: DraftImage | undefined;
+  let imageError: string | undefined;
+  try {
+    image = await designPosterForDraft(client, draft.text, draft.topic, channel, draft.threadTs);
+    await updateDraftImage(draftId, image);
+  } catch (err: any) {
+    console.error("Poster regeneration failed:", err);
+    imageError = err.message;
+    // Keep whatever poster the draft already had — a failed retry shouldn't throw away a
+    // usable previous attempt.
+    image = draft.image;
+  }
+
+  await client.chat.update({
+    channel,
+    ts: messageTs,
+    text: confirmPromptText(!!image, imageError),
+    blocks: confirmBlocks(draftId, !!image, imageError),
+  });
 }
 
 app.action("reject_post", async ({ ack, body, client }) => {
@@ -960,7 +1081,25 @@ async function handleRegenerate(style: RefinementStyle, draftId: string, channel
     await updateDraftText(draftId, postText, sources);
 
     await client.chat.update({ channel, ts: draft.messageTs, text: `*Draft LinkedIn post:*\n\n${postText}${formatSourcesBlock(sources)}` });
-    await client.chat.update({ channel, ts: messageTs, text: "Post the above to LinkedIn?", blocks: confirmBlocks(draftId) });
+
+    // The existing poster's headline was written for the draft that just got rewritten, so
+    // it's redesigned alongside the text instead of being left to contradict it.
+    let image = draft.image;
+    let imageError: string | undefined;
+    if (draft.image) {
+      await client.chat.update({ channel, ts: messageTs, text: "Designing a matching poster… :art:", blocks: [] });
+      try {
+        image = await designPosterForDraft(client, postText, draft.topic, channel, draft.threadTs);
+      } catch (err: any) {
+        console.error("Poster regeneration failed:", err);
+        // Drop the stale poster rather than publishing one that no longer matches the text.
+        image = undefined;
+        imageError = err.message;
+      }
+      await updateDraftImage(draftId, image);
+    }
+
+    await client.chat.update({ channel, ts: messageTs, text: confirmPromptText(!!image, imageError), blocks: confirmBlocks(draftId, !!image, imageError) });
   } catch (err: any) {
     console.error(err);
     await client.chat.update({ channel, ts: messageTs, text: `❌ Failed to regenerate: ${err.message}`, blocks: [] });
