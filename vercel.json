@@ -7,5 +7,9 @@
     "api/calendar/publish.ts": {
       "maxDuration": 300
     }
-  }
+  },
+  "includeFiles": [
+    "node_modules/harfbuzzjs/**/*.wasm",
+    "node_modules/@resvg/resvg-js/**/*.wasm"
+  ]
 }
