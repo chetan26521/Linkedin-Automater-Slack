@@ -2,10 +2,10 @@ import { config } from "./config.js";
 
 export interface GeneratedPost {
   postText: string;
-  // Web search citations actually used while researching the post — only ever populated
-  // for the providers with a server-side search tool wired up here (anthropic, gemini) and
-  // only when the model decided a search was warranted. Empty otherwise, including when it
-  // answered from its own trained knowledge without searching.
+  // Web search citations actually used while researching the post — only ever populated for
+  // the providers with a server-side search tool wired up here (anthropic, gemini). The prompt
+  // instructs the model to always search at least once, but this can still come back empty if
+  // the model's own tool call turned up nothing citable, or for providers with no search tool.
   sources: { url: string; title: string }[];
 }
 
@@ -271,12 +271,12 @@ ${threadContext ? `\nAdditional context from the Slack thread:\n${threadContext}
 
 Content style: ${styleInstruction}
 
-Before writing, research the topic (if you have web search available) so the post reflects
-current, accurate information rather than relying solely on what you already know — look for
-credible sources, and where genuinely relevant, how the topic is actually being discussed by
-practitioners and the community (industry write-ups, Reddit threads, posts from recognized
-voices in the space). Use your judgment on what's relevant; don't force sources that don't fit
-just to have used search.
+Before writing, if you have web search available, use it at least once — even for a topic that
+feels evergreen or already well within your knowledge. Find a concrete, current fact, statistic,
+example, or notable discussion to ground the post in (industry write-ups, recent news, posts from
+recognized voices in the space). Search again if the first result isn't useful, or if the topic
+would benefit from more than one angle. Only skip searching entirely if no search tool is
+available to you.
 
 ${POST_FORMAT_RULES}
 ${
