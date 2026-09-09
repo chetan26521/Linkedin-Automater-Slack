@@ -117,6 +117,12 @@ interface AnthropicTextBlock {
 // research the topic (including community/social discussion, where it judges that
 // relevant) before writing, and cites what it actually used. Only used for post text —
 // content-calendar pillar planning doesn't need live research.
+//
+// tool_choice forces the first content block to be a web_search call — without it, Claude
+// very often judges a topic "evergreen" and skips search entirely, leaving sources empty.
+// This only pins the *opening* move: once the search result comes back, Claude continues
+// generating normally (more searches, then final text), same as the standard "force one
+// tool call, then let the model finish the turn" pattern for tool_choice.
 async function callAnthropicWithSearch(prompt: string): Promise<{ text: string; sources: { url: string; title: string }[] }> {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -130,6 +136,7 @@ async function callAnthropicWithSearch(prompt: string): Promise<{ text: string; 
       max_tokens: 4096,
       messages: [{ role: "user", content: prompt }],
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: MAX_WEB_SEARCHES_PER_POST }],
+      tool_choice: { type: "tool", name: "web_search" },
     }),
   });
 
