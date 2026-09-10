@@ -4,7 +4,7 @@ Say **"create a post: <topic>"** in a Slack channel the bot is in. It will:
 
 1. Ask how the post should be written: **💡 Thought Leadership**, **📊 Industry Insight**, **🎯 Case Study**, or **📢 Announcement**.
 2. Draft LinkedIn post copy in that style with your configured LLM provider ([OpenRouter](https://openrouter.ai), OpenAI, Anthropic, or Gemini), based on your message (and thread, if replying in one). When `LLM_PROVIDER=anthropic` or `gemini`, the model researches the topic first with its server-side web search tool (Claude's `web_search`, capped at 5 searches per post; Gemini's Google Search grounding) before writing, and the draft message lists the sources it actually cited. Not available on openrouter/openai; if the model judges a search unnecessary for the topic, no sources are shown either. The prompt also steers away from em-dash-as-pause and slash-as-shorthand patterns that read as obviously AI-written.
-3. Design a poster graphic for the post with Gemini's image model, and preview it in the thread. A separate art-direction step decides the headline and visual concept from the finished post *before* anything is drawn, which is what makes the poster come out with one clear, correctly spelled message instead of a wall of garbled text — see [src/imageGen.ts](src/imageGen.ts). Skipped entirely if `POST_IMAGES=off` or no `GEMINI_API_KEY` is set.
+3. Design a poster graphic for the post with OpenAI's `gpt-image-1`, and preview it in the thread. A separate art-direction step decides the headline and visual concept from the finished post *before* anything is drawn, which is what makes the poster come out with one clear, correctly spelled message instead of a wall of garbled text — see [src/imageGen.ts](src/imageGen.ts). Skipped entirely if `POST_IMAGES=off` or no `OPENAI_API_KEY` is set.
 4. Post the exact draft text back to Slack with **✅ Post with Poster** / **🖼️ New Poster** / **📄 Text Only** / **❌ Reject** buttons. **New Poster** redesigns the graphic for the same copy, as many times as you like (earlier attempts stay in the thread so you can compare them). **Text Only** publishes the copy with no image.
 5. Only publish to your LinkedIn profile if you click one of the post buttons. Ignoring it entirely means nothing is ever posted (both the pending style request and any draft expire after 30 minutes).
 6. Clicking **❌ Reject** doesn't discard anything yet — it shows a follow-up: **📐 More Concise**, **🎩 More Formal**, **📊 More Data-Driven**, **🔀 Different Angle**, or **🗑️ Dismiss**. Picking a style regenerates the post (same topic/thread context/content style, revised per that feedback), redesigns the poster to match the new copy, and shows the post buttons again — you can loop through as many regenerations as you like. **Dismiss** is the only action that actually throws the draft away.
@@ -48,14 +48,14 @@ openai and anthropic are paid (no free tier); openrouter's default model is free
 
 > **A Gemini Pro / Google AI Pro subscription does not cover this.** That subscription is for the Gemini app, Gemini in Workspace, and Gemini CLI — it grants no API access at all. `GEMINI_API_KEY` is a separate credential from [AI Studio](https://aistudio.google.com/apikey), billed on its own meter, with a free tier that is generally ample for this bot's volume.
 
-### Poster images (Gemini)
+### Poster images (OpenAI)
 
-Poster generation always runs through Gemini's image model, independently of `LLM_PROVIDER` — so you can keep writing copy with Claude or OpenAI and still get posters, as long as `GEMINI_API_KEY` is set. It switches itself on automatically when that key is present.
+Poster generation always runs through OpenAI's `gpt-image-1`, independently of `LLM_PROVIDER` — so you can keep writing copy with Claude or Gemini and still get posters, as long as `OPENAI_API_KEY` is set. It switches itself on automatically when that key is present.
 
-- `GEMINI_API_KEY` — required for posters, whichever provider writes the text.
-- `POST_IMAGES` — `on` or `off`. Defaults to `on` when `GEMINI_API_KEY` is set and `off` otherwise. Set it to `off` for text-only posts without having to remove the key.
-- `GEMINI_IMAGE_MODEL` — default `gemini-2.5-flash-image`, which is unusually good at rendering legible text inside an image (the whole point of a poster). `gemini-3-pro-image-preview` gives noticeably better typography and layout at a higher price, if it is available on your key.
-- `POST_IMAGE_ASPECT_RATIO` — default `1:1`, which fills more of a mobile feed than a `1.91:1` banner without risking the crop that portrait ratios get in some LinkedIn surfaces.
+- `OPENAI_API_KEY` — required for posters, whichever provider writes the text. The same key as the `openai` text-provider option above; uncomment it there even if `LLM_PROVIDER` is set to something else.
+- `POST_IMAGES` — `on` or `off`. Defaults to `on` when `OPENAI_API_KEY` is set and `off` otherwise. Set it to `off` for text-only posts without having to remove the key.
+- `OPENAI_IMAGE_MODEL` — default `gpt-image-1`, OpenAI's current image model, which renders legible text well (the whole point of a poster).
+- `POST_IMAGE_ASPECT_RATIO` — default `1:1`, which fills more of a mobile feed than a `1.91:1` banner without risking the crop that portrait ratios get in some LinkedIn surfaces. `gpt-image-1` only supports square/landscape/portrait sizes, so this is mapped to the closest of the three rather than passed through as an arbitrary ratio.
 
 ## 3. Create the Slack app
 

@@ -30,6 +30,9 @@ function requiredForProvider(name: string, provider: LlmProvider): string {
 // Read separately from the config object below because poster generation keys off whether
 // this is set, regardless of which provider writes the text (see postImages).
 const geminiApiKey = requiredForProvider("GEMINI_API_KEY", "gemini");
+// Same reasoning — poster generation always uses OpenAI's image model, independently of
+// which provider LLM_PROVIDER selects for the post text itself (see postImages).
+const openaiApiKey = requiredForProvider("OPENAI_API_KEY", "openai");
 
 export const config = {
   slackBotToken: required("SLACK_BOT_TOKEN"),
@@ -43,18 +46,18 @@ export const config = {
   llmProvider,
   openrouterApiKey: requiredForProvider("OPENROUTER_API_KEY", "openrouter"),
   openrouterModel: process.env.OPENROUTER_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b:free",
-  openaiApiKey: requiredForProvider("OPENAI_API_KEY", "openai"),
+  openaiApiKey,
   openaiModel: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
   anthropicApiKey: requiredForProvider("ANTHROPIC_API_KEY", "anthropic"),
   anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5",
   geminiApiKey,
   geminiModel: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
-  // Poster generation is deliberately independent of LLM_PROVIDER — only Gemini has an
-  // image model wired up here, so posters keep working when the text comes from Claude or
-  // OpenAI as long as GEMINI_API_KEY is set. Defaults on when a key is present, since
-  // there's nothing to gain from having the key and silently not using it.
-  postImages: (process.env.POST_IMAGES ?? (geminiApiKey ? "on" : "off")).toLowerCase() !== "off",
-  geminiImageModel: process.env.GEMINI_IMAGE_MODEL ?? "gemini-2.5-flash-image",
+  // Poster generation is deliberately independent of LLM_PROVIDER — only OpenAI's image
+  // model is wired up here, so posters keep working when the text comes from Claude,
+  // Gemini, or OpenRouter as long as OPENAI_API_KEY is set. Defaults on when a key is
+  // present, since there's nothing to gain from having the key and silently not using it.
+  postImages: (process.env.POST_IMAGES ?? (openaiApiKey ? "on" : "off")).toLowerCase() !== "off",
+  openaiImageModel: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1",
   // 1:1 fills more of a mobile LinkedIn feed than a 1.91:1 banner without risking the
   // crop that portrait ratios get in some LinkedIn surfaces.
   postImageAspectRatio: process.env.POST_IMAGE_ASPECT_RATIO ?? "1:1",

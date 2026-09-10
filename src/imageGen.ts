@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 import { generateFromPrompt, parseJsonFromModel } from "./postWriter.js";
 
-const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations";
 
 // LinkedIn accepts far longer alt text than this, but screen readers read it out in full
 // and it's meant to describe a poster, not narrate it.
@@ -30,9 +30,9 @@ interface ArtBrief {
 }
 
 export function assertImageGenConfigured(): void {
-  if (!config.geminiApiKey) {
+  if (!config.openaiApiKey) {
     throw new Error(
-      "Poster generation needs GEMINI_API_KEY (a Gemini API key from https://aistudio.google.com/apikey). Set it, or set POST_IMAGES=off to publish text-only posts."
+      "Poster generation needs OPENAI_API_KEY (an OpenAI API key from https://platform.openai.com/api-keys). Set it, or set POST_IMAGES=off to publish text-only posts."
     );
   }
 }
@@ -103,77 +103,50 @@ Design requirements:
 - The design bleeds to the edges of the image. No outer border, frame, drop shadow, or mockup of a printed poster on a wall — the image itself IS the poster.`;
 }
 
-function requestImage(body: string): Promise<Response> {
-  return fetch(`${GEMINI_API_BASE}/${config.geminiImageModel}:generateContent`, {
+// gpt-image-1 only takes discrete sizes, not an arbitrary aspect ratio — map the
+// configured ratio to the closest of the three, falling back to "auto" for anything
+// that isn't clearly square, landscape, or portrait.
+function toOpenAiImageSize(aspectRatio: string): "1024x1024" | "1536x1024" | "1024x1536" | "auto" {
+  const match = aspectRatio.match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/);
+  if (!match) return "auto";
+  const ratio = Number(match[1]) / Number(match[2]);
+  if (Math.abs(ratio - 1) < 0.05) return "1024x1024";
+  return ratio > 1 ? "1536x1024" : "1024x1536";
+}
+
+async function callOpenAiImage(prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
+  const response = await fetch(OPENAI_IMAGES_URL, {
     method: "POST",
     headers: {
-      "x-goog-api-key": config.geminiApiKey,
+      Authorization: `Bearer ${config.openaiApiKey}`,
       "Content-Type": "application/json",
     },
-    body,
+    body: JSON.stringify({
+      model: config.openaiImageModel,
+      prompt,
+      size: toOpenAiImageSize(config.postImageAspectRatio),
+      quality: "high",
+      output_format: "png",
+    }),
   });
-}
-
-interface GeminiImagePart {
-  text?: string;
-  inlineData?: { mimeType?: string; data?: string };
-}
-
-async function callGeminiImage(prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
-  const buildBody = (withImageConfig: boolean) =>
-    JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      ...(withImageConfig ? { generationConfig: { imageConfig: { aspectRatio: config.postImageAspectRatio } } } : {}),
-    });
-
-  let response = await requestImage(buildBody(true));
-
-  // generationConfig.imageConfig is only understood by the newer image models; the ones that
-  // don't know it reject the whole request with a 400 rather than ignoring the field. Retry
-  // without it so a GEMINI_IMAGE_MODEL override can't hard-fail on one unsupported knob —
-  // the poster just comes out in that model's default aspect ratio instead.
-  if (response.status === 400) {
-    const detail = await response.text();
-    if (!/imageconfig|aspect/i.test(detail)) {
-      throw new Error(`Gemini image API failed: 400 ${detail}`);
-    }
-    console.warn(`Gemini image model rejected imageConfig, retrying without it: ${detail.slice(0, 300)}`);
-    response = await requestImage(buildBody(false));
-  }
 
   if (!response.ok) {
-    throw new Error(`Gemini image API failed: ${response.status} ${await response.text()}`);
+    throw new Error(`OpenAI image API failed: ${response.status} ${await response.text()}`);
   }
 
-  const json = (await response.json()) as {
-    candidates?: { content?: { parts?: GeminiImagePart[] }; finishReason?: string }[];
-    promptFeedback?: { blockReason?: string };
-  };
-
-  if (json.promptFeedback?.blockReason) {
-    throw new Error(`Gemini declined to generate the poster (${json.promptFeedback.blockReason}).`);
+  const json = (await response.json()) as { data?: { b64_json?: string }[] };
+  const b64 = json.data?.[0]?.b64_json;
+  if (!b64) {
+    throw new Error(`OpenAI returned no image: ${JSON.stringify(json).slice(0, 300)}`);
   }
 
-  const candidate = json.candidates?.[0];
-  const parts = candidate?.content?.parts ?? [];
-  const image = parts.find((p) => p.inlineData?.data)?.inlineData;
-
-  if (!image?.data) {
-    // Image models answer a refusal, or a prompt they misread as a text question, with a
-    // text part instead of an image — surface that text, it's usually the real explanation.
-    const explanation = parts.map((p) => p.text ?? "").join(" ").trim();
-    throw new Error(
-      `Gemini returned no image (finish reason: ${candidate?.finishReason ?? "unknown"})${explanation ? `: ${explanation.slice(0, 300)}` : "."}`
-    );
-  }
-
-  return { bytes: Buffer.from(image.data, "base64"), mimeType: image.mimeType ?? "image/png" };
+  return { bytes: Buffer.from(b64, "base64"), mimeType: "image/png" };
 }
 
 /** Generates a poster graphic for a finished post. Two model calls: art brief, then image. */
 export async function generatePostImage(postText: string, topic: string): Promise<PostImage> {
   assertImageGenConfigured();
   const brief = await buildArtBrief(postText, topic);
-  const { bytes, mimeType } = await callGeminiImage(composeImagePrompt(brief));
+  const { bytes, mimeType } = await callOpenAiImage(composeImagePrompt(brief));
   return { bytes, mimeType, altText: brief.altText, headline: brief.headline };
 }
