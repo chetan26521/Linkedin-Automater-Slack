@@ -113,10 +113,19 @@ interface AnthropicTextBlock {
   citations?: { type: string; url?: string; title?: string }[];
 }
 
+interface AnthropicWebSearchResultBlock {
+  type: "web_search_tool_result";
+  // A list on success; a single { type: "web_search_tool_result_error", error_code } object
+  // on failure (e.g. rate limited) — checked with Array.isArray before iterating.
+  content: { type: string; url?: string; title?: string }[] | { type: string; error_code?: string };
+}
+
 // Like callAnthropic, but with the server-side web_search tool enabled so Claude can
 // research the topic (including community/social discussion, where it judges that
-// relevant) before writing, and cites what it actually used. Only used for post text —
-// content-calendar pillar planning doesn't need live research.
+// relevant) before writing. Returns every result the search turned up, not just the subset
+// Claude happened to cite inline — citations only attach when the final prose quotes a
+// result directly, so relying on citations alone drops results Claude read but paraphrased.
+// Only used for post text — content-calendar pillar planning doesn't need live research.
 //
 // tool_choice forces the first content block to be a web_search call — without it, Claude
 // very often judges a topic "evergreen" and skips search entirely, leaving sources empty.
@@ -144,16 +153,33 @@ async function callAnthropicWithSearch(prompt: string): Promise<{ text: string; 
     throw new Error(`Anthropic API failed: ${response.status} ${await response.text()}`);
   }
 
-  const json = (await response.json()) as { content?: Array<AnthropicTextBlock | { type: string }> };
+  const json = (await response.json()) as {
+    content?: Array<AnthropicTextBlock | AnthropicWebSearchResultBlock | { type: string }>;
+  };
   const textBlocks = (json.content ?? []).filter((b): b is AnthropicTextBlock => b.type === "text");
   const text = textBlocks.map((b) => b.text).join("").trim();
   if (!text) throw new Error("Anthropic returned no content — try again shortly.");
 
   const sourcesByUrl = new Map<string, string>();
+
+  // Citations on the final text — what Claude actually drew on to write a specific claim.
   for (const block of textBlocks) {
     for (const citation of block.citations ?? []) {
       if (citation.type === "web_search_result_location" && citation.url) {
         sourcesByUrl.set(citation.url, citation.title ?? citation.url);
+      }
+    }
+  }
+
+  // The raw search results themselves, whether or not Claude ended up citing them inline —
+  // tool_choice guarantees a search happened, but not that the final prose quotes it, and
+  // the user wants every source the search turned up, not just the subset Claude cited.
+  const resultBlocks = (json.content ?? []).filter((b): b is AnthropicWebSearchResultBlock => b.type === "web_search_tool_result");
+  for (const block of resultBlocks) {
+    if (!Array.isArray(block.content)) continue;
+    for (const result of block.content) {
+      if (result.type === "web_search_result" && result.url) {
+        sourcesByUrl.set(result.url, result.title ?? result.url);
       }
     }
   }
