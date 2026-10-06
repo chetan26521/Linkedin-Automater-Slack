@@ -1,5 +1,11 @@
 # LinkedIn post bot for Slack
 
+Any number of people can share one Slack channel. Each post goes to the LinkedIn account of **whoever triggered it**. User B's "create a post" publishes to B's profile, and User C's goes to C's.
+
+**First time:** say **"connect linkedin"** in the channel. The bot replies with a private **🔗 Connect LinkedIn** button that only you can see. Approve access on LinkedIn and you're done. Anyone who triggers a flow before connecting gets the same button instead. A normal LinkedIn account is all you need, with no developer account or special access. LinkedIn tokens last about 60 days, and the bot reminds you to reconnect in the final week. Say **"disconnect linkedin"** to remove your connection at any time.
+
+Only the person who started a draft, calendar or edit can approve, regenerate or dismiss it, since it publishes to their account. Anyone else who clicks gets a private note and nothing changes.
+
 Say **"create a post: <topic>"** in a Slack channel the bot is in. It will:
 
 1. Ask how the post should be written: **💡 Thought Leadership**, **📊 Industry Insight**, **🎯 Case Study**, or **📢 Announcement**.
@@ -48,12 +54,14 @@ openai and anthropic are paid (no free tier); openrouter's default model is free
 
 > **A Gemini Pro / Google AI Pro subscription does not cover this.** That subscription is for the Gemini app, Gemini in Workspace, and Gemini CLI — it grants no API access at all. `GEMINI_API_KEY` is a separate credential from [AI Studio](https://aistudio.google.com/apikey), billed on its own meter, with a free tier that is generally ample for this bot's volume.
 
-### Poster images (OpenAI)
+### Poster images (Gemini or OpenAI)
 
-Poster generation always runs through OpenAI's `gpt-image-1`, independently of `LLM_PROVIDER` — so you can keep writing copy with Claude or Gemini and still get posters, as long as `OPENAI_API_KEY` is set. It switches itself on automatically when that key is present.
+Poster generation runs through Gemini's image model or OpenAI's `gpt-image-1`, independently of `LLM_PROVIDER` — so you can keep writing copy with Claude and still get posters, as long as the image provider's key is set. It switches itself on automatically when that key is present.
 
-- `OPENAI_API_KEY` — required for posters, whichever provider writes the text. The same key as the `openai` text-provider option above; uncomment it there even if `LLM_PROVIDER` is set to something else.
-- `POST_IMAGES` — `on` or `off`. Defaults to `on` when `OPENAI_API_KEY` is set and `off` otherwise. Set it to `off` for text-only posts without having to remove the key.
+- `IMAGE_PROVIDER` — `gemini` or `openai`. Defaults to `gemini` when `GEMINI_API_KEY` is set, otherwise `openai`.
+- `GEMINI_API_KEY` / `OPENAI_API_KEY` — the chosen image provider's key, whichever provider writes the text. The same keys as the text-provider options above.
+- `POST_IMAGES` — `on` or `off`. Defaults to `on` when the image provider's key is set and `off` otherwise. Set it to `off` for text-only posts without having to remove the key.
+- `GEMINI_IMAGE_MODEL` — default `gemini-2.5-flash-image`.
 - `OPENAI_IMAGE_MODEL` — default `gpt-image-1`, OpenAI's current image model, which renders legible text well (the whole point of a poster).
 - `POST_IMAGE_ASPECT_RATIO` — default `1:1`, which fills more of a mobile feed than a `1.91:1` banner without risking the crop that portrait ratios get in some LinkedIn surfaces. `gpt-image-1` only supports square/landscape/portrait sizes, so this is mapped to the closest of the three rather than passed through as an arbitrary ratio.
 
@@ -79,8 +87,10 @@ The bot runs over Slack's HTTP Events API + Interactivity (no Socket Mode) so it
 2. Under **Products**, request:
    - **Sign In with LinkedIn using OpenID Connect** (self-serve, instant)
    - **Share on LinkedIn** (self-serve, instant) — this grants `w_member_social`, needed to publish posts.
-3. Under **Auth**, add `http://localhost:3000/callback` as an **Authorized redirect URL**.
+3. Under **Auth**, add `https://<your-production-domain>/api/linkedin/callback` as an **Authorized redirect URL**. For local dev through a tunnel, also add `https://<your-tunnel>/api/linkedin/callback` and set `LINKEDIN_REDIRECT_URI` to it. It has to match exactly, so use the stable production domain, not a per-deployment `*.vercel.app` URL.
 4. Copy the **Client ID** and **Client Secret** into `.env`.
+
+You only need this one app. The people posting don't need developer accounts or roles on it. They connect their own personal LinkedIn from Slack.
 
 ## 5. Fill in `.env`
 
@@ -90,15 +100,12 @@ cp .env.example .env
 
 Fill in `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `LLM_PROVIDER` + its matching API key, `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`. Leave `KV_REST_API_URL`/`_TOKEN` for step 6 and `QSTASH_*`/`APP_BASE_URL` for step 7 (only needed for the content calendar).
 
-Then run the one-time LinkedIn connect script:
+Also set:
 
-```
-npm run linkedin-auth
-```
+- `TOKEN_ENCRYPTION_KEY`: 32 random bytes, base64. Every stored LinkedIn token is encrypted with it. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. If you change it later, everyone is disconnected and has to connect again.
+- `APP_BASE_URL`: your stable production URL. The LinkedIn redirect URL is built from it (`$APP_BASE_URL/api/linkedin/callback`). Alternatively, set `LINKEDIN_REDIRECT_URI` directly.
 
-Open the printed URL, approve access, and copy the `LINKEDIN_ACCESS_TOKEN` / `LINKEDIN_PERSON_ID` it prints into `.env`.
-
-> LinkedIn access tokens last ~60 days. When posting starts failing with an auth error, just re-run `npm run linkedin-auth`.
+**Upgrading from the single-account setup?** Keep `LINKEDIN_ACCESS_TOKEN` / `LINKEDIN_PERSON_ID` and add `LINKEDIN_OWNER_SLACK_USER_ID` (your Slack member ID: profile → ⋮ → *Copy member ID*). That person keeps posting with the old token, and keeps their old "edit post" history, until they say "connect linkedin" themselves. After that, the `.env` token is no longer used. `npm run linkedin-auth` still works for producing such a token, but it's no longer needed.
 
 ## 6. Deploy to Vercel
 
@@ -106,7 +113,7 @@ Drafts and pending style requests are stored in Redis (not in memory), since a s
 
 1. Create a free Redis database via your Vercel project's **Storage** tab → **Create Database** → pick a Redis option (Upstash-backed; the free tier is enough for this bot). This automatically injects `KV_REST_API_URL` and `KV_REST_API_TOKEN` into your project — Vercel's Storage integration uses these legacy `KV_*` names (a holdover from the deprecated `@vercel/kv` product) even though it's really just Redis under the hood. Alternatively, create a database directly at https://console.upstash.com (no card required) and copy its **REST API** `URL`/`TOKEN` values into `KV_REST_API_URL`/`KV_REST_API_TOKEN` yourself, in both your local `.env` and Vercel's env vars — the code only cares about those two env var names, not which path produced them.
 2. Push this repo to GitHub (already done if you're reading this from the repo) and import it into Vercel: https://vercel.com/new.
-3. In **Settings → Environment Variables**, confirm `KV_REST_API_URL`/`KV_REST_API_TOKEN` are present, and add everything else from your `.env`: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `LLM_PROVIDER` + its key, `GEMINI_API_KEY` (for posters, whichever provider writes the text), `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `LINKEDIN_ACCESS_TOKEN`, `LINKEDIN_PERSON_ID` (and `TRIGGER_PHRASE` if you changed it). Skip `PORT` — that's local-only.
+3. In **Settings → Environment Variables**, confirm `KV_REST_API_URL`/`KV_REST_API_TOKEN` are present, and add everything else from your `.env`: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `LLM_PROVIDER` + its key, `GEMINI_API_KEY` (for posters, whichever provider writes the text), `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, `APP_BASE_URL` (plus `LINKEDIN_ACCESS_TOKEN` / `LINKEDIN_PERSON_ID` / `LINKEDIN_OWNER_SLACK_USER_ID` if you're keeping the legacy owner token, and `TRIGGER_PHRASE` if you changed it). Skip `PORT` — that's local-only.
 4. Deploy. Note the deployment URL (e.g. `https://your-app.vercel.app`).
 5. Go back to your Slack app's **Event Subscriptions** and **Interactivity** settings (step 3) and set both Request URLs to `https://your-app.vercel.app/api/slack/events`, now that it's live. Slack will verify the URL on save.
 6. For local dev, pull the same values with `vercel env pull .env.development.local` (after `vercel link`), or copy them manually into `.env` from step 1. To let Slack reach your machine for local testing, tunnel it (e.g. `ngrok http 3000`) and temporarily point the Slack Request URLs at the tunnel's `/api/slack/events` instead.
@@ -136,7 +143,9 @@ Then in Slack: `create a post: we just shipped X, here's why it matters`, `conte
 
 - LinkedIn bumps its API version string monthly (`LINKEDIN_VERSION` in [src/linkedin.ts](src/linkedin.ts)). If publishing starts failing with a version-related error, check LinkedIn's current version at https://learn.microsoft.com/en-us/linkedin/marketing/versioning and update it.
 - Pending style requests and drafts (text only) live in Redis with a 30-minute TTL, keyed by an id on the Slack buttons. If you never click through, they just expire — you'd ask it to create the post again. Published-post history is different: it's a plain bounded list (last 20), not TTL'd, since it's real history rather than transient in-flight state.
-- This is scoped to your personal LinkedIn profile (`w_member_social`). Posting to a company Page needs the `w_organization_social` scope and admin access to that Page, which isn't wired up here.
+- LinkedIn connections are stored in Redis per Slack user (`linkedin-account:<slack user id>`), with the access token encrypted (AES-256-GCM, `TOKEN_ENCRYPTION_KEY`) and a TTL matching LinkedIn's own expiry, so a dead token disappears and the bot asks for a reconnect. The OAuth `state` that ties a LinkedIn approval back to a Slack user is random, single-use, expires after 15 minutes, and is only ever shown to that user. See [src/linkedinAccounts.ts](src/linkedinAccounts.ts) and [api/linkedin/callback.ts](api/linkedin/callback.ts). "edit post" history is per user, too.
+- Every draft goes through a humanize rewrite, then a deterministic scrub (dashes, stock transitions, extra hashtags, leftover preambles), then up to two targeted fix-ups for any AI tells that can still be detected (stock phrases, "it's not X, it's Y", engagement-bait endings, uniform sentence lengths, one-line-per-paragraph). See `finalizePost` in [src/postWriter.ts](src/postWriter.ts). The prompt also forbids inventing personal anecdotes or results the request didn't supply. Run `npm run check-ai-detection -- --topic "..." --compare` to measure the effect.
+- This is scoped to each user's personal LinkedIn profile (`w_member_social`). Posting to a company Page needs the `w_organization_social` scope and admin access to that Page, which isn't wired up here.
 - The trigger phrases are `"create a post"`, `"content calendar"`, and `"edit post"` (case-insensitive substring match), configurable via `TRIGGER_PHRASE` / `CALENDAR_TRIGGER_PHRASE` / `EDIT_TRIGGER_PHRASE` in `.env`.
 - OpenRouter's free models can be lower quality than paid ones and occasionally get rate-limited or rotated out (see step 2). Switching `LLM_PROVIDER` to `openai` or `anthropic` is a config-only change — no code edits needed.
 - Every Slack button click acks immediately, then does the slow work (LLM call, LinkedIn publish) wrapped in `waitUntil()` from `@vercel/functions` ([src/slackApp.ts](src/slackApp.ts)) — this is required on Vercel because a serverless function's execution environment can otherwise be frozen right after the HTTP response is sent, silently killing any work still in flight.

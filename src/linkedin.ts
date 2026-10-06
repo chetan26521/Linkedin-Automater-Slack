@@ -1,4 +1,4 @@
-import { config } from "./config.js";
+import type { LinkedInCredentials } from "./linkedinAccounts.js";
 
 const API_BASE = "https://api.linkedin.com";
 // LinkedIn bumps this monthly. If posts start failing with a version error,
@@ -14,19 +14,11 @@ function escapeLittleText(text: string): string {
   return text.replace(/[\\{}@[\]()<>*_~|]/g, (ch) => `\\${ch}`);
 }
 
-function assertConfigured(): void {
-  if (!config.linkedinAccessToken || !config.linkedinPersonId) {
-    throw new Error(
-      "LinkedIn is not connected yet. Run `npm run linkedin-auth` once and copy the printed values into .env."
-    );
-  }
-}
-
-async function linkedinFetch(path: string, init: RequestInit = {}): Promise<Response> {
+async function linkedinFetch(credentials: LinkedInCredentials, path: string, init: RequestInit = {}): Promise<Response> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${config.linkedinAccessToken}`,
+      Authorization: `Bearer ${credentials.accessToken}`,
       "LinkedIn-Version": LINKEDIN_VERSION,
       "X-Restli-Protocol-Version": "2.0.0",
       ...init.headers,
@@ -53,11 +45,10 @@ export interface PostImageRef {
  * the bytes go up with a plain PUT. An image that never gets attached to a post is simply
  * an unused asset, so it's safe to upload one while a draft is still awaiting approval.
  */
-export async function uploadImage(bytes: Buffer, contentType: string): Promise<string> {
-  assertConfigured();
-  const personUrn = `urn:li:person:${config.linkedinPersonId}`;
+export async function uploadImage(credentials: LinkedInCredentials, bytes: Buffer, contentType: string): Promise<string> {
+  const personUrn = `urn:li:person:${credentials.personId}`;
 
-  const initialized = await linkedinFetch("/rest/images?action=initializeUpload", {
+  const initialized = await linkedinFetch(credentials, "/rest/images?action=initializeUpload", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ initializeUploadRequest: { owner: personUrn } }),
@@ -74,7 +65,7 @@ export async function uploadImage(bytes: Buffer, contentType: string): Promise<s
   const uploaded = await fetch(value.uploadUrl, {
     method: "PUT",
     headers: {
-      Authorization: `Bearer ${config.linkedinAccessToken}`,
+      Authorization: `Bearer ${credentials.accessToken}`,
       "Content-Type": contentType,
     },
     // Copied into a plain Uint8Array because Node's Buffer type isn't assignable to fetch's
@@ -90,14 +81,13 @@ export async function uploadImage(bytes: Buffer, contentType: string): Promise<s
 }
 
 /**
- * Publishes a post to the connected LinkedIn profile, with an optional uploaded poster
+ * Publishes a post to the given member's LinkedIn profile, with an optional uploaded poster
  * attached. Returns the created post's URN.
  */
-export async function publishPost(text: string, image?: PostImageRef): Promise<string> {
-  assertConfigured();
-  const personUrn = `urn:li:person:${config.linkedinPersonId}`;
+export async function publishPost(credentials: LinkedInCredentials, text: string, image?: PostImageRef): Promise<string> {
+  const personUrn = `urn:li:person:${credentials.personId}`;
 
-  const response = await linkedinFetch("/rest/posts", {
+  const response = await linkedinFetch(credentials, "/rest/posts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -123,10 +113,8 @@ export async function publishPost(text: string, image?: PostImageRef): Promise<s
  * commentary is patched — an attached poster stays exactly as published, since LinkedIn
  * does not allow swapping the media on a live post.
  */
-export async function updatePost(urn: string, text: string): Promise<void> {
-  assertConfigured();
-
-  await linkedinFetch(`/rest/posts/${encodeURIComponent(urn)}`, {
+export async function updatePost(credentials: LinkedInCredentials, urn: string, text: string): Promise<void> {
+  await linkedinFetch(credentials, `/rest/posts/${encodeURIComponent(urn)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-RestLi-Method": "PARTIAL_UPDATE" },
     body: JSON.stringify({ patch: { $set: { commentary: escapeLittleText(text) } } }),

@@ -30,9 +30,19 @@ function requiredForProvider(name: string, provider: LlmProvider): string {
 // Read separately from the config object below because poster generation keys off whether
 // this is set, regardless of which provider writes the text (see postImages).
 const geminiApiKey = requiredForProvider("GEMINI_API_KEY", "gemini");
-// Same reasoning — poster generation always uses OpenAI's image model, independently of
+// Same reasoning — OpenAI can draw the posters (IMAGE_PROVIDER=openai) independently of
 // which provider LLM_PROVIDER selects for the post text itself (see postImages).
 const openaiApiKey = requiredForProvider("OPENAI_API_KEY", "openai");
+
+// Which image model draws the posters — independent of LLM_PROVIDER. Explicit
+// IMAGE_PROVIDER wins; otherwise prefer Gemini when its key is set, then OpenAI.
+export type ImageProvider = "gemini" | "openai";
+const IMAGE_PROVIDERS: ImageProvider[] = ["gemini", "openai"];
+const imageProvider = (process.env.IMAGE_PROVIDER?.toLowerCase() ?? (geminiApiKey ? "gemini" : "openai")) as ImageProvider;
+if (!IMAGE_PROVIDERS.includes(imageProvider)) {
+  throw new Error(`Invalid IMAGE_PROVIDER: "${imageProvider}". Must be one of: ${IMAGE_PROVIDERS.join(", ")}.`);
+}
+const imageProviderKey = imageProvider === "gemini" ? geminiApiKey : openaiApiKey;
 
 export const config = {
   slackBotToken: required("SLACK_BOT_TOKEN"),
@@ -52,22 +62,42 @@ export const config = {
   anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5",
   geminiApiKey,
   geminiModel: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
-  // Poster generation is deliberately independent of LLM_PROVIDER — only OpenAI's image
-  // model is wired up here, so posters keep working when the text comes from Claude,
-  // Gemini, or OpenRouter as long as OPENAI_API_KEY is set. Defaults on when a key is
-  // present, since there's nothing to gain from having the key and silently not using it.
-  postImages: (process.env.POST_IMAGES ?? (openaiApiKey ? "on" : "off")).toLowerCase() !== "off",
+  // Poster generation is deliberately independent of LLM_PROVIDER, so posters keep working
+  // whichever provider writes the text, as long as the IMAGE_PROVIDER's key is set. Defaults
+  // on when that key is present, since there's nothing to gain from having the key and
+  // silently not using it.
+  imageProvider,
+  postImages: (process.env.POST_IMAGES ?? (imageProviderKey ? "on" : "off")).toLowerCase() !== "off",
   openaiImageModel: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1",
+  geminiImageModel: process.env.GEMINI_IMAGE_MODEL ?? "gemini-2.5-flash-image",
   // 1:1 fills more of a mobile LinkedIn feed than a 1.91:1 banner without risking the
   // crop that portrait ratios get in some LinkedIn surfaces.
   postImageAspectRatio: process.env.POST_IMAGE_ASPECT_RATIO ?? "1:1",
+  // Legacy single-account credentials from `npm run linkedin-auth`. Only used as a fallback
+  // for LINKEDIN_OWNER_SLACK_USER_ID until that person connects through Slack themselves —
+  // everyone else's tokens live per-user in Redis (see src/linkedinAccounts.ts).
   linkedinAccessToken: process.env.LINKEDIN_ACCESS_TOKEN ?? "",
   linkedinPersonId: process.env.LINKEDIN_PERSON_ID ?? "",
+  linkedinOwnerSlackUserId: process.env.LINKEDIN_OWNER_SLACK_USER_ID ?? "",
   linkedinClientId: process.env.LINKEDIN_CLIENT_ID ?? "",
   linkedinClientSecret: process.env.LINKEDIN_CLIENT_SECRET ?? "",
+  // Must match an Authorized redirect URL on the LinkedIn app exactly, so it can't fall back
+  // to VERCEL_URL (a different hostname on every deployment) the way appBaseUrl does.
+  linkedinRedirectUri:
+    process.env.LINKEDIN_REDIRECT_URI ??
+    (process.env.APP_BASE_URL
+      ? `${process.env.APP_BASE_URL.replace(/\/$/, "")}/api/linkedin/callback`
+      : process.env.VERCEL_PROJECT_PRODUCTION_URL
+        ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}/api/linkedin/callback`
+        : ""),
+  // 32 bytes, base64 — encrypts every stored LinkedIn access token at rest. Generate with
+  // `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
+  tokenEncryptionKey: process.env.TOKEN_ENCRYPTION_KEY ?? "",
   triggerPhrase: process.env.TRIGGER_PHRASE ?? "create a post",
   calendarTriggerPhrase: process.env.CALENDAR_TRIGGER_PHRASE ?? "content calendar",
   editTriggerPhrase: process.env.EDIT_TRIGGER_PHRASE ?? "edit post",
+  connectTriggerPhrase: process.env.CONNECT_TRIGGER_PHRASE ?? "connect linkedin",
+  disconnectTriggerPhrase: process.env.DISCONNECT_TRIGGER_PHRASE ?? "disconnect linkedin",
   // Content calendar scheduling (Upstash QStash) — optional; only needed once someone
   // actually approves a calendar. See assertQstashConfigured() in src/calendar.ts.
   qstashToken: process.env.QSTASH_TOKEN ?? "",

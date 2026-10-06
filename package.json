@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "build": "tsc",
-    "linkedin-auth": "tsx scripts/linkedin-auth.ts"
+    "linkedin-auth": "tsx scripts/linkedin-auth.ts",
+    "check-ai-detection": "tsx scripts/check-ai-detection.ts"
   },
   "dependencies": {
     "@slack/bolt": "^4.1.0",

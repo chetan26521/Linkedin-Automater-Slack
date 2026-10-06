@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { generatePostText, revisePublishedPost, CONTENT_STYLES, REFINEMENT_STYLES, type ContentStyle, type RefinementStyle } from "./postWriter.js";
 import { generateContentPillars, scheduledDatesInWindow, scheduleCalendarEntries, CALENDAR_DURATIONS } from "./calendar.js";
 import { publishPost, updatePost, uploadImage } from "./linkedin.js";
+import { createConnectUrl, disconnectLinkedInAccount, getLinkedInAccount, isExpiringSoon, type LinkedInAccount } from "./linkedinAccounts.js";
 import { generatePostImage, type PostImage } from "./imageGen.js";
 import {
   saveDraft,
@@ -44,6 +45,9 @@ const TRIGGER = new RegExp(config.triggerPhrase, "i");
 const CALENDAR_TRIGGER = new RegExp(config.calendarTriggerPhrase, "i");
 // Matches "edit post" anywhere in the message, case-insensitive.
 const EDIT_TRIGGER = new RegExp(config.editTriggerPhrase, "i");
+// Matches "connect linkedin" / "disconnect linkedin" anywhere in the message, case-insensitive.
+const CONNECT_TRIGGER = new RegExp(config.connectTriggerPhrase, "i");
+const DISCONNECT_TRIGGER = new RegExp(config.disconnectTriggerPhrase, "i");
 // Strips a leading connector word left behind after the trigger phrase, e.g.
 // "create a post on Zoho IoT" -> topic "Zoho IoT" instead of "on Zoho IoT".
 const LEADING_CONNECTOR = /^(on|about|regarding|for)\s+/i;
@@ -287,6 +291,97 @@ export const app = new App({
   receiver,
 });
 
+// ---- Per-user LinkedIn accounts ----
+//
+// Every flow posts as whoever started it in Slack. These prompts are all ephemeral: the
+// connect link is bound to the person it's shown to, so it must never be visible to anyone else.
+
+async function sendConnectPrompt(client: any, channel: string, user: string, threadTs: string | undefined, message: string): Promise<void> {
+  const url = await createConnectUrl(user);
+  await client.chat.postEphemeral({
+    channel,
+    user,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+    text: `${message} ${url}`,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text: message } },
+      {
+        type: "actions",
+        elements: [{ type: "button", text: { type: "plain_text", text: "🔗 Connect LinkedIn" }, style: "primary", url, action_id: "connect_linkedin_link" }],
+      },
+      { type: "context", elements: [{ type: "mrkdwn", text: "This link is just for you and works once, for 15 minutes." }] },
+    ],
+  });
+}
+
+/**
+ * Returns the Slack user's LinkedIn account, or prompts them (privately) to connect one and
+ * returns undefined. Also nudges them to reconnect when the token is close to expiring, since
+ * LinkedIn gives self-serve apps no refresh token.
+ */
+async function requireLinkedInAccount(client: any, channel: string, user: string, threadTs?: string): Promise<LinkedInAccount | undefined> {
+  const account = await getLinkedInAccount(user);
+  if (!account) {
+    await sendConnectPrompt(client, channel, user, threadTs, "Connect your LinkedIn account first, so posts you create here go to *your* profile. It's a one-time step.");
+    return undefined;
+  }
+  if (isExpiringSoon(account)) {
+    await sendConnectPrompt(client, channel, user, threadTs, `Heads up: your LinkedIn connection expires on ${formatPublishedDate(account.expiresAt)}. Reconnect to keep posting without interruption.`);
+  }
+  return account;
+}
+
+/**
+ * Only the person a draft/calendar/edit belongs to can act on it, since it publishes to their
+ * LinkedIn. Anyone else clicking gets a private note and nothing changes.
+ */
+async function ensureOwner(client: any, channel: string, actor: string, owner: string, threadTs?: string): Promise<boolean> {
+  if (actor === owner) return true;
+  await client.chat.postEphemeral({
+    channel,
+    user: actor,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+    text: `Only <@${owner}> can do that, since this one goes to their LinkedIn. Say "${config.triggerPhrase} ..." to make your own.`,
+  });
+  return false;
+}
+
+async function handleConnect(msg: any, client: any) {
+  const threadTs = msg.thread_ts || msg.ts;
+  try {
+    const existing = await getLinkedInAccount(msg.user);
+    const message = existing
+      ? `You're connected as *${existing.name}*. Use the button to reconnect, or to switch to a different LinkedIn account.`
+      : "Connect your LinkedIn account so posts you create here go to your profile.";
+    await sendConnectPrompt(client, msg.channel, msg.user, threadTs, message);
+  } catch (err: any) {
+    console.error(err);
+    await client.chat.postEphemeral({ channel: msg.channel, user: msg.user, thread_ts: threadTs, text: `Couldn't start the LinkedIn connection: ${err.message}` });
+  }
+}
+
+async function handleDisconnect(msg: any, client: any) {
+  const threadTs = msg.thread_ts || msg.ts;
+  try {
+    const removed = await disconnectLinkedInAccount(msg.user);
+    await client.chat.postEphemeral({
+      channel: msg.channel,
+      user: msg.user,
+      thread_ts: threadTs,
+      text: removed ? "Disconnected. Nothing will be posted to your LinkedIn until you connect again." : "You don't have a LinkedIn account connected here.",
+    });
+  } catch (err: any) {
+    console.error(err);
+    await client.chat.postEphemeral({ channel: msg.channel, user: msg.user, thread_ts: threadTs, text: `Something went wrong: ${err.message}` });
+  }
+}
+
+// URL buttons open the link client-side but Slack still sends an interaction for them,
+// which has to be acked or the user sees a warning icon.
+app.action("connect_linkedin_link", async ({ ack }) => {
+  await ack();
+});
+
 // Bolt sends the required HTTP 200 for events as soon as the payload is verified,
 // before this listener runs — so everything below is already "after the response"
 // and must be wrapped in waitUntil() to survive on a serverless function. Same
@@ -302,6 +397,17 @@ app.message(async ({ message, client }) => {
 // Checked in priority order: fresh "content calendar" / "edit post" triggers, then whether
 // this message answers a pending question from either of those flows, then "create a post".
 async function routeMessage(msg: any, client: any) {
+  // Disconnect first — "disconnect linkedin" also contains "connect linkedin".
+  if (DISCONNECT_TRIGGER.test(msg.text)) {
+    await handleDisconnect(msg, client);
+    return;
+  }
+
+  if (CONNECT_TRIGGER.test(msg.text)) {
+    await handleConnect(msg, client);
+    return;
+  }
+
   if (CALENDAR_TRIGGER.test(msg.text)) {
     await handleCalendarTrigger(msg, client);
     return;
@@ -337,6 +443,8 @@ async function handleCalendarTrigger(msg: any, client: any) {
   const threadTs = msg.thread_ts || msg.ts;
 
   try {
+    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, threadTs))) return;
+
     await saveAwaitingCalendarTopic({
       channel: msg.channel,
       threadTs,
@@ -385,17 +493,20 @@ app.action("calendar_generate_submit", async ({ ack, body, client }) => {
   const pendingId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
   const values = payload.state?.values ?? {};
 
-  waitUntil(handleGenerateCalendar(pendingId, values, channel, messageTs, client));
+  waitUntil(handleGenerateCalendar(pendingId, values, channel, messageTs, actor, client));
 });
 
-async function handleGenerateCalendar(pendingId: string, values: any, channel: string, messageTs: string, client: any) {
+async function handleGenerateCalendar(pendingId: string, values: any, channel: string, messageTs: string, actor: string, client: any) {
   const pending = await getPendingRequest(pendingId);
   if (!pending) {
     await client.chat.update({ channel, ts: messageTs, text: "This request expired — ask me for a content calendar again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, pending.requestedBy, pending.threadTs))) return;
 
   // Each field lives under its own block_id (section accessories, not one shared actions
   // block), so state.values is keyed per-field rather than all under one block.
@@ -476,16 +587,19 @@ app.action("approve_calendar", async ({ ack, body, client }) => {
   const reviewId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleApproveCalendar(reviewId, channel, messageTs, client));
+  waitUntil(handleApproveCalendar(reviewId, channel, messageTs, actor, client));
 });
 
-async function handleApproveCalendar(reviewId: string, channel: string, messageTs: string, client: any) {
+async function handleApproveCalendar(reviewId: string, channel: string, messageTs: string, actor: string, client: any) {
   const review = await getCalendarReview(reviewId);
   if (!review) {
     await client.chat.update({ channel, ts: messageTs, text: "This calendar expired — ask me for a content calendar again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, review.requestedBy, review.threadTs))) return;
 
   await client.chat.update({ channel, ts: messageTs, text: "Scheduling…", blocks: [] });
 
@@ -518,16 +632,19 @@ app.action("regenerate_calendar", async ({ ack, body, client }) => {
   const reviewId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleRegenerateCalendar(reviewId, channel, messageTs, client));
+  waitUntil(handleRegenerateCalendar(reviewId, channel, messageTs, actor, client));
 });
 
-async function handleRegenerateCalendar(reviewId: string, channel: string, messageTs: string, client: any) {
+async function handleRegenerateCalendar(reviewId: string, channel: string, messageTs: string, actor: string, client: any) {
   const review = await getCalendarReview(reviewId);
   if (!review) {
     await client.chat.update({ channel, ts: messageTs, text: "This calendar expired — ask me for a content calendar again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, review.requestedBy, review.threadTs))) return;
 
   await client.chat.update({ channel, ts: messageTs, text: "Regenerating the calendar… :writing_hand:", blocks: [] });
 
@@ -554,11 +671,14 @@ app.action("dismiss_calendar", async ({ ack, body, client }) => {
   const reviewId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleDismissCalendar(reviewId, channel, messageTs, client));
+  waitUntil(handleDismissCalendar(reviewId, channel, messageTs, actor, client));
 });
 
-async function handleDismissCalendar(reviewId: string, channel: string, messageTs: string, client: any) {
+async function handleDismissCalendar(reviewId: string, channel: string, messageTs: string, actor: string, client: any) {
+  const review = await getCalendarReview(reviewId);
+  if (review && !(await ensureOwner(client, channel, actor, review.requestedBy, review.threadTs))) return;
   await deleteCalendarReview(reviewId);
   await client.chat.update({ channel, ts: messageTs, text: "🗑️ Calendar discarded — nothing was scheduled.", blocks: [] });
 }
@@ -577,7 +697,7 @@ function formatPublishedDate(epochMs: number): string {
   return `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCDate()}`;
 }
 
-function editPostPickerBlocks(threadTs: string, posts: PublishedPost[]) {
+function editPostPickerBlocks(threadTs: string, owner: string, posts: PublishedPost[]) {
   return [
     {
       type: "section" as const,
@@ -591,9 +711,10 @@ function editPostPickerBlocks(threadTs: string, posts: PublishedPost[]) {
         // The thread's own root ts is encoded into the value (not re-derived later from
         // payload.message.thread_ts) — that field isn't reliably present on every message,
         // so relying on it silently breaks the "reply to answer" step further down the flow.
+        // The owner is encoded too: the list is their posts, so only they may pick from it.
         options: posts.map((p) => ({
           text: { type: "plain_text" as const, text: `${formatPublishedDate(p.publishedAt)} · ${truncateForOption(p.text, 60)}` },
-          value: `${threadTs}|${p.urn}`,
+          value: `${threadTs}|${owner}|${p.urn}`,
         })),
       },
     },
@@ -622,9 +743,11 @@ async function handleEditTrigger(msg: any, client: any) {
   const threadTs = msg.thread_ts || msg.ts;
 
   try {
-    const posts = await listPublishedPosts(EDIT_POST_PICKER_LIMIT);
+    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, threadTs))) return;
+
+    const posts = await listPublishedPosts(msg.user, EDIT_POST_PICKER_LIMIT);
     if (posts.length === 0) {
-      await client.chat.postMessage({ channel: msg.channel, thread_ts: threadTs, text: "No published posts found — nothing's been posted through me yet." });
+      await client.chat.postMessage({ channel: msg.channel, thread_ts: threadTs, text: `<@${msg.user}>, I haven't posted anything to your LinkedIn yet, so there's nothing to edit.` });
       return;
     }
 
@@ -632,7 +755,7 @@ async function handleEditTrigger(msg: any, client: any) {
       channel: msg.channel,
       thread_ts: threadTs,
       text: "Which post would you like to edit?",
-      blocks: editPostPickerBlocks(threadTs, posts),
+      blocks: editPostPickerBlocks(threadTs, msg.user, posts),
     });
   } catch (err: any) {
     console.error(err);
@@ -643,17 +766,19 @@ async function handleEditTrigger(msg: any, client: any) {
 app.action("edit_post_select", async ({ ack, body, client }) => {
   await ack();
   const payload = body as any;
-  const [threadTs, urn] = (payload.actions[0].selected_option.value as string).split("|");
+  const [threadTs, owner, urn] = (payload.actions[0].selected_option.value as string).split("|");
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
-  const requestedBy = payload.user.id as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleEditPostSelected(urn, channel, messageTs, threadTs, requestedBy, client));
+  waitUntil(handleEditPostSelected(urn, channel, messageTs, threadTs, owner, actor, client));
 });
 
-async function handleEditPostSelected(urn: string, channel: string, messageTs: string, threadTs: string, requestedBy: string, client: any) {
+async function handleEditPostSelected(urn: string, channel: string, messageTs: string, threadTs: string, requestedBy: string, actor: string, client: any) {
   try {
-    const posts = await listPublishedPosts(EDIT_POST_PICKER_LIMIT);
+    if (!(await ensureOwner(client, channel, actor, requestedBy, threadTs))) return;
+
+    const posts = await listPublishedPosts(requestedBy, EDIT_POST_PICKER_LIMIT);
     const post = posts.find((p) => p.urn === urn);
     if (!post) {
       await client.chat.update({ channel, ts: messageTs, text: "That post is no longer in the recent history — ask me to edit a post again.", blocks: [] });
@@ -708,22 +833,28 @@ app.action("apply_post_edit", async ({ ack, body, client }) => {
   const reviewId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleApplyPostEdit(reviewId, channel, messageTs, client));
+  waitUntil(handleApplyPostEdit(reviewId, channel, messageTs, actor, client));
 });
 
-async function handleApplyPostEdit(reviewId: string, channel: string, messageTs: string, client: any) {
+async function handleApplyPostEdit(reviewId: string, channel: string, messageTs: string, actor: string, client: any) {
   const review = await getPostEditReview(reviewId);
   if (!review) {
     await client.chat.update({ channel, ts: messageTs, text: "This edit expired — ask me to edit a post again.", blocks: [] });
     return;
   }
 
+  if (!(await ensureOwner(client, channel, actor, review.requestedBy, review.threadTs))) return;
+
+  const account = await requireLinkedInAccount(client, channel, review.requestedBy, review.threadTs);
+  if (!account) return;
+
   await client.chat.update({ channel, ts: messageTs, text: "Updating the live post…", blocks: [] });
 
   try {
-    await updatePost(review.urn, review.proposedText);
-    await recordPublishedPost({ urn: review.urn, text: review.proposedText, publishedAt: Date.now() });
+    await updatePost(account, review.urn, review.proposedText);
+    await recordPublishedPost(review.requestedBy, { urn: review.urn, text: review.proposedText, publishedAt: Date.now() });
     await deletePostEditReview(reviewId);
 
     await client.chat.update({ channel, ts: messageTs, text: "✅ Post updated on LinkedIn.", blocks: [] });
@@ -739,16 +870,19 @@ app.action("revise_post_edit_again", async ({ ack, body, client }) => {
   const reviewId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleRevisePostEditAgain(reviewId, channel, messageTs, client));
+  waitUntil(handleRevisePostEditAgain(reviewId, channel, messageTs, actor, client));
 });
 
-async function handleRevisePostEditAgain(reviewId: string, channel: string, messageTs: string, client: any) {
+async function handleRevisePostEditAgain(reviewId: string, channel: string, messageTs: string, actor: string, client: any) {
   const review = await getPostEditReview(reviewId);
   if (!review) {
     await client.chat.update({ channel, ts: messageTs, text: "This edit expired — ask me to edit a post again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, review.requestedBy, review.threadTs))) return;
 
   await client.chat.update({ channel, ts: messageTs, text: "What would you like to change this time? Reply in this thread.", blocks: [] });
 
@@ -770,11 +904,14 @@ app.action("cancel_post_edit", async ({ ack, body, client }) => {
   const reviewId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleCancelPostEdit(reviewId, channel, messageTs, client));
+  waitUntil(handleCancelPostEdit(reviewId, channel, messageTs, actor, client));
 });
 
-async function handleCancelPostEdit(reviewId: string, channel: string, messageTs: string, client: any) {
+async function handleCancelPostEdit(reviewId: string, channel: string, messageTs: string, actor: string, client: any) {
+  const review = await getPostEditReview(reviewId);
+  if (review && !(await ensureOwner(client, channel, actor, review.requestedBy, review.threadTs))) return;
   await deletePostEditReview(reviewId);
   await client.chat.update({ channel, ts: messageTs, text: "🗑️ Edit cancelled — the live post was not changed.", blocks: [] });
 }
@@ -784,6 +921,8 @@ async function handleTrigger(msg: any, client: any) {
   const threadTs = msg.thread_ts || msg.ts;
 
   try {
+    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, threadTs))) return;
+
     let threadContext: string | undefined;
     if (msg.thread_ts) {
       const replies = await client.conversations.replies({ channel: msg.channel, ts: msg.thread_ts, limit: 20 });
@@ -823,8 +962,9 @@ app.action(/^style_(thought-leadership|industry-insight|case-study|announcement)
   const pendingId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleStyleSelected(contentStyle, pendingId, channel, messageTs, client));
+  waitUntil(handleStyleSelected(contentStyle, pendingId, channel, messageTs, actor, client));
 });
 
 // Renders web search citations (see GeneratedPost.sources in postWriter.ts) as a Slack
@@ -864,10 +1004,14 @@ async function previewPosterInSlack(client: any, poster: PostImage, channel: str
 // Slack thread. Uploading now rather than at publish time means the image bytes never have
 // to be parked anywhere between serverless invocations — the draft carries only the
 // resulting image URN, and whoever approves it is approving the exact image that goes out.
-// An uploaded image that never gets attached to a post is simply an unused asset.
-async function designPosterForDraft(client: any, postText: string, topic: string, channel: string, threadTs: string): Promise<DraftImage> {
+// An uploaded image that never gets attached to a post is simply an unused asset. The image is
+// owned by the draft requester's LinkedIn account, since LinkedIn only lets a member attach
+// images they own.
+async function designPosterForDraft(client: any, requestedBy: string, postText: string, topic: string, channel: string, threadTs: string): Promise<DraftImage> {
+  const account = await getLinkedInAccount(requestedBy);
+  if (!account) throw new Error(`<@${requestedBy}> needs to connect LinkedIn first (say "${config.connectTriggerPhrase}"), then try the poster again`);
   const poster = await generatePostImage(postText, topic);
-  const urn = await uploadImage(poster.bytes, poster.mimeType);
+  const urn = await uploadImage(account, poster.bytes, poster.mimeType);
   await previewPosterInSlack(client, poster, channel, threadTs);
   return { urn, altText: poster.altText, headline: poster.headline };
 }
@@ -887,7 +1031,7 @@ export async function createDraftAndPostConfirmation(
   const draftMessage = await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
-    text: `*Draft LinkedIn post:*\n\n${postText}${formatSourcesBlock(sources)}`,
+    text: `*Draft LinkedIn post for <@${requestedBy}>:*\n\n${postText}${formatSourcesBlock(sources)}`,
   });
 
   // A poster failing to generate must not cost the finished post text, so the failure is
@@ -896,7 +1040,7 @@ export async function createDraftAndPostConfirmation(
   let imageError: string | undefined;
   if (config.postImages) {
     try {
-      image = await designPosterForDraft(client, postText, topic, channel, threadTs);
+      image = await designPosterForDraft(client, requestedBy, postText, topic, channel, threadTs);
     } catch (err: any) {
       console.error("Poster generation failed:", err);
       imageError = err.message;
@@ -926,12 +1070,14 @@ export async function createDraftAndPostConfirmation(
   });
 }
 
-async function handleStyleSelected(contentStyle: ContentStyle, pendingId: string, channel: string, messageTs: string, client: any) {
+async function handleStyleSelected(contentStyle: ContentStyle, pendingId: string, channel: string, messageTs: string, actor: string, client: any) {
   const pending = await getPendingRequest(pendingId);
   if (!pending) {
     await client.chat.update({ channel, ts: messageTs, text: "This request expired — ask me to create a post again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, pending.requestedBy, pending.threadTs))) return;
 
   const styleLabel = CONTENT_STYLES.find((s) => s.style === contentStyle)?.label ?? contentStyle;
   await client.chat.update({ channel, ts: messageTs, text: `Drafting a ${styleLabel} post… :writing_hand:`, blocks: [] });
@@ -963,25 +1109,33 @@ app.action(/^approve_post(_text_only)?$/, async ({ ack, action, body, client }) 
   const draftId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleApprove(draftId, channel, messageTs, client, textOnly));
+  waitUntil(handleApprove(draftId, channel, messageTs, actor, client, textOnly));
 });
 
-async function handleApprove(draftId: string, channel: string, messageTs: string, client: any, textOnly: boolean) {
+async function handleApprove(draftId: string, channel: string, messageTs: string, actor: string, client: any, textOnly: boolean) {
   const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: "This draft expired — ask me to create a post again." });
     return;
   }
 
+  if (!(await ensureOwner(client, channel, actor, draft.requestedBy, draft.threadTs))) return;
+
+  // Checked before touching the message, so the buttons stay put for a retry after connecting.
+  const account = await requireLinkedInAccount(client, channel, draft.requestedBy, draft.threadTs);
+  if (!account) return;
+
   const image = textOnly ? undefined : draft.image;
   await client.chat.update({ channel, ts: messageTs, text: image ? "Posting to LinkedIn with the poster…" : "Posting to LinkedIn…", blocks: [] });
 
   try {
-    const urn = await publishPost(draft.text, image);
-    await recordPublishedPost({ urn, text: draft.text, publishedAt: Date.now() });
+    const urn = await publishPost(account, draft.text, image);
+    await recordPublishedPost(draft.requestedBy, { urn, text: draft.text, publishedAt: Date.now() });
     await deleteDraft(draftId);
-    await client.chat.postMessage({ channel, thread_ts: messageTs, text: image ? "✅ Posted to LinkedIn with the poster." : "✅ Posted to LinkedIn." });
+    const where = `${account.name}'s LinkedIn`;
+    await client.chat.postMessage({ channel, thread_ts: messageTs, text: image ? `✅ Posted to ${where} with the poster.` : `✅ Posted to ${where}.` });
   } catch (err: any) {
     console.error(err);
     await client.chat.postMessage({ channel, thread_ts: messageTs, text: `❌ Failed to post to LinkedIn: ${err.message}` });
@@ -994,26 +1148,29 @@ app.action("regenerate_image", async ({ ack, body, client }) => {
   const draftId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleRegenerateImage(draftId, channel, messageTs, client));
+  waitUntil(handleRegenerateImage(draftId, channel, messageTs, actor, client));
 });
 
 // Designs a replacement poster for an unchanged draft. Earlier previews are deliberately
 // left in the thread rather than deleted, so the reviewer can compare attempts and pick by
 // clicking approve under whichever confirmation message they prefer.
-async function handleRegenerateImage(draftId: string, channel: string, messageTs: string, client: any) {
+async function handleRegenerateImage(draftId: string, channel: string, messageTs: string, actor: string, client: any) {
   const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.update({ channel, ts: messageTs, text: "This draft expired — ask me to create a post again.", blocks: [] });
     return;
   }
 
+  if (!(await ensureOwner(client, channel, actor, draft.requestedBy, draft.threadTs))) return;
+
   await client.chat.update({ channel, ts: messageTs, text: "Designing a new poster… :art:", blocks: [] });
 
   let image: DraftImage | undefined;
   let imageError: string | undefined;
   try {
-    image = await designPosterForDraft(client, draft.text, draft.topic, channel, draft.threadTs);
+    image = await designPosterForDraft(client, draft.requestedBy, draft.text, draft.topic, channel, draft.threadTs);
     await updateDraftImage(draftId, image);
   } catch (err: any) {
     console.error("Poster regeneration failed:", err);
@@ -1037,16 +1194,19 @@ app.action("reject_post", async ({ ack, body, client }) => {
   const draftId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleReject(draftId, channel, messageTs, client));
+  waitUntil(handleReject(draftId, channel, messageTs, actor, client));
 });
 
-async function handleReject(draftId: string, channel: string, messageTs: string, client: any) {
+async function handleReject(draftId: string, channel: string, messageTs: string, actor: string, client: any) {
   const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.update({ channel, ts: messageTs, text: "This draft expired — ask me to create a post again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, draft.requestedBy, draft.threadTs))) return;
 
   await client.chat.update({
     channel,
@@ -1063,16 +1223,19 @@ app.action(/^regenerate_(concise|formal|data-driven|different-angle)$/, async ({
   const draftId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleRegenerate(style, draftId, channel, messageTs, client));
+  waitUntil(handleRegenerate(style, draftId, channel, messageTs, actor, client));
 });
 
-async function handleRegenerate(style: RefinementStyle, draftId: string, channel: string, messageTs: string, client: any) {
+async function handleRegenerate(style: RefinementStyle, draftId: string, channel: string, messageTs: string, actor: string, client: any) {
   const draft = await getDraft(draftId);
   if (!draft) {
     await client.chat.update({ channel, ts: messageTs, text: "This draft expired — ask me to create a post again.", blocks: [] });
     return;
   }
+
+  if (!(await ensureOwner(client, channel, actor, draft.requestedBy, draft.threadTs))) return;
 
   await client.chat.update({ channel, ts: messageTs, text: "Regenerating… :writing_hand:", blocks: [] });
 
@@ -1080,7 +1243,7 @@ async function handleRegenerate(style: RefinementStyle, draftId: string, channel
     const { postText, sources } = await generatePostText(draft.topic, draft.contentStyle, draft.threadContext, { style, previousText: draft.text });
     await updateDraftText(draftId, postText, sources);
 
-    await client.chat.update({ channel, ts: draft.messageTs, text: `*Draft LinkedIn post:*\n\n${postText}${formatSourcesBlock(sources)}` });
+    await client.chat.update({ channel, ts: draft.messageTs, text: `*Draft LinkedIn post for <@${draft.requestedBy}>:*\n\n${postText}${formatSourcesBlock(sources)}` });
 
     // The existing poster's headline was written for the draft that just got rewritten, so
     // it's redesigned alongside the text instead of being left to contradict it.
@@ -1089,7 +1252,7 @@ async function handleRegenerate(style: RefinementStyle, draftId: string, channel
     if (draft.image) {
       await client.chat.update({ channel, ts: messageTs, text: "Designing a matching poster… :art:", blocks: [] });
       try {
-        image = await designPosterForDraft(client, postText, draft.topic, channel, draft.threadTs);
+        image = await designPosterForDraft(client, draft.requestedBy, postText, draft.topic, channel, draft.threadTs);
       } catch (err: any) {
         console.error("Poster regeneration failed:", err);
         // Drop the stale poster rather than publishing one that no longer matches the text.
@@ -1112,11 +1275,14 @@ app.action("dismiss_draft", async ({ ack, body, client }) => {
   const draftId = payload.actions[0].value as string;
   const channel = payload.channel.id as string;
   const messageTs = payload.message.ts as string;
+  const actor = payload.user.id as string;
 
-  waitUntil(handleDismiss(draftId, channel, messageTs, client));
+  waitUntil(handleDismiss(draftId, channel, messageTs, actor, client));
 });
 
-async function handleDismiss(draftId: string, channel: string, messageTs: string, client: any) {
+async function handleDismiss(draftId: string, channel: string, messageTs: string, actor: string, client: any) {
+  const draft = await getDraft(draftId);
+  if (draft && !(await ensureOwner(client, channel, actor, draft.requestedBy, draft.threadTs))) return;
   await deleteDraft(draftId);
   await client.chat.update({ channel, ts: messageTs, text: "🗑️ Discarded — nothing was posted to LinkedIn.", blocks: [] });
 }

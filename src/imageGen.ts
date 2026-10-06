@@ -2,6 +2,7 @@ import { config } from "./config.js";
 import { generateFromPrompt, parseJsonFromModel } from "./postWriter.js";
 
 const OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 // LinkedIn accepts far longer alt text than this, but screen readers read it out in full
 // and it's meant to describe a poster, not narrate it.
@@ -30,6 +31,14 @@ interface ArtBrief {
 }
 
 export function assertImageGenConfigured(): void {
+  if (config.imageProvider === "gemini") {
+    if (!config.geminiApiKey) {
+      throw new Error(
+        "Poster generation needs GEMINI_API_KEY (a Gemini API key from https://aistudio.google.com/apikey) when IMAGE_PROVIDER=gemini. Set it, or set POST_IMAGES=off to publish text-only posts."
+      );
+    }
+    return;
+  }
   if (!config.openaiApiKey) {
     throw new Error(
       "Poster generation needs OPENAI_API_KEY (an OpenAI API key from https://platform.openai.com/api-keys). Set it, or set POST_IMAGES=off to publish text-only posts."
@@ -143,10 +152,78 @@ async function callOpenAiImage(prompt: string): Promise<{ bytes: Buffer; mimeTyp
   return { bytes: Buffer.from(b64, "base64"), mimeType: "image/png" };
 }
 
+function requestGeminiImage(body: string): Promise<Response> {
+  return fetch(`${GEMINI_API_BASE}/${config.geminiImageModel}:generateContent`, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": config.geminiApiKey,
+      "Content-Type": "application/json",
+    },
+    body,
+  });
+}
+
+interface GeminiImagePart {
+  text?: string;
+  inlineData?: { mimeType?: string; data?: string };
+}
+
+async function callGeminiImage(prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
+  const buildBody = (withImageConfig: boolean) =>
+    JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      ...(withImageConfig ? { generationConfig: { imageConfig: { aspectRatio: config.postImageAspectRatio } } } : {}),
+    });
+
+  let response = await requestGeminiImage(buildBody(true));
+
+  // generationConfig.imageConfig is only understood by the newer image models; the ones that
+  // don't know it reject the whole request with a 400 rather than ignoring the field. Retry
+  // without it so a GEMINI_IMAGE_MODEL override can't hard-fail on one unsupported knob —
+  // the poster just comes out in that model's default aspect ratio instead.
+  if (response.status === 400) {
+    const detail = await response.text();
+    if (!/imageconfig|aspect/i.test(detail)) {
+      throw new Error(`Gemini image API failed: 400 ${detail}`);
+    }
+    console.warn(`Gemini image model rejected imageConfig, retrying without it: ${detail.slice(0, 300)}`);
+    response = await requestGeminiImage(buildBody(false));
+  }
+
+  if (!response.ok) {
+    throw new Error(`Gemini image API failed: ${response.status} ${await response.text()}`);
+  }
+
+  const json = (await response.json()) as {
+    candidates?: { content?: { parts?: GeminiImagePart[] }; finishReason?: string }[];
+    promptFeedback?: { blockReason?: string };
+  };
+
+  if (json.promptFeedback?.blockReason) {
+    throw new Error(`Gemini declined to generate the poster (${json.promptFeedback.blockReason}).`);
+  }
+
+  const candidate = json.candidates?.[0];
+  const parts = candidate?.content?.parts ?? [];
+  const image = parts.find((p) => p.inlineData?.data)?.inlineData;
+
+  if (!image?.data) {
+    // Image models answer a refusal, or a prompt they misread as a text question, with a
+    // text part instead of an image — surface that text, it's usually the real explanation.
+    const explanation = parts.map((p) => p.text ?? "").join(" ").trim();
+    throw new Error(
+      `Gemini returned no image (finish reason: ${candidate?.finishReason ?? "unknown"})${explanation ? `: ${explanation.slice(0, 300)}` : "."}`
+    );
+  }
+
+  return { bytes: Buffer.from(image.data, "base64"), mimeType: image.mimeType ?? "image/png" };
+}
+
 /** Generates a poster graphic for a finished post. Two model calls: art brief, then image. */
 export async function generatePostImage(postText: string, topic: string): Promise<PostImage> {
   assertImageGenConfigured();
   const brief = await buildArtBrief(postText, topic);
-  const { bytes, mimeType } = await callOpenAiImage(composeImagePrompt(brief));
+  const prompt = composeImagePrompt(brief);
+  const { bytes, mimeType } = config.imageProvider === "gemini" ? await callGeminiImage(prompt) : await callOpenAiImage(prompt);
   return { bytes, mimeType, altText: brief.altText, headline: brief.headline };
 }

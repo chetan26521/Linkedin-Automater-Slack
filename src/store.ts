@@ -5,7 +5,7 @@ import type { ContentStyle } from "./postWriter.js";
 // Serverless functions don't share memory across invocations, so drafts and pending
 // requests live in Redis (via Vercel's Storage integration) instead of an in-process
 // Map, keyed with a TTL.
-const redis = new Redis({ url: config.redisUrl, token: config.redisToken });
+export const redis = new Redis({ url: config.redisUrl, token: config.redisToken });
 const TTL_SECONDS = 30 * 60; // entries expire 30 min after creation if never resolved
 const TOPIC_ANSWER_TTL_SECONDS = 10 * 60; // shorter — waiting on a human to type a reply
 
@@ -150,26 +150,38 @@ export async function deleteCalendarReview(id: string): Promise<void> {
   await redis.del(calendarReviewKey(id));
 }
 
-// Bounded history of posts published through this bot, most-recent-first — real history,
-// not transient state, so it's a plain Redis list rather than a TTL'd key. Editing a post
-// re-pushes the updated entry rather than mutating the old one in place; the freshest
-// version naturally sorts first and the stale duplicate ages out of the bounded list.
+// Bounded history of posts published through this bot, per Slack user, most-recent-first —
+// real history, not transient state, so it's a plain Redis list rather than a TTL'd key.
+// Per user because "edit post" can only edit posts on the editor's own LinkedIn account.
+// Editing a post re-pushes the updated entry rather than mutating the old one in place; the
+// freshest version naturally sorts first and the stale duplicate ages out of the bounded list.
 export interface PublishedPost {
   urn: string;
   text: string;
   publishedAt: number;
 }
 
-const PUBLISHED_POSTS_KEY = "published-posts";
+const publishedPostsKey = (slackUserId: string) => `published-posts:${slackUserId}`;
+// The single-account history from before posts were tracked per user — all of it went to
+// LINKEDIN_OWNER_SLACK_USER_ID's profile, so it's shown only to them.
+const LEGACY_PUBLISHED_POSTS_KEY = "published-posts";
 const MAX_PUBLISHED_POSTS_HISTORY = 20;
 
-export async function recordPublishedPost(post: PublishedPost): Promise<void> {
-  await redis.lpush(PUBLISHED_POSTS_KEY, post);
-  await redis.ltrim(PUBLISHED_POSTS_KEY, 0, MAX_PUBLISHED_POSTS_HISTORY - 1);
+export async function recordPublishedPost(slackUserId: string, post: PublishedPost): Promise<void> {
+  await redis.lpush(publishedPostsKey(slackUserId), post);
+  await redis.ltrim(publishedPostsKey(slackUserId), 0, MAX_PUBLISHED_POSTS_HISTORY - 1);
 }
 
-export async function listPublishedPosts(limit: number): Promise<PublishedPost[]> {
-  return redis.lrange<PublishedPost>(PUBLISHED_POSTS_KEY, 0, limit - 1);
+export async function listPublishedPosts(slackUserId: string, limit: number): Promise<PublishedPost[]> {
+  const own = await redis.lrange<PublishedPost>(publishedPostsKey(slackUserId), 0, limit - 1);
+  if (slackUserId !== config.linkedinOwnerSlackUserId) return own;
+
+  const legacy = await redis.lrange<PublishedPost>(LEGACY_PUBLISHED_POSTS_KEY, 0, limit - 1);
+  const seen = new Set<string>();
+  return [...own, ...legacy]
+    .sort((a, b) => b.publishedAt - a.publishedAt)
+    .filter((p) => !seen.has(p.urn) && seen.add(p.urn))
+    .slice(0, limit);
 }
 
 // Holds an "edit post" selection until the user's next message answers "what would you
