@@ -295,6 +295,10 @@ export const app = new App({
 //
 // Every flow posts as whoever started it in Slack. These prompts are all ephemeral: the
 // connect link is bound to the person it's shown to, so it must never be visible to anyone else.
+//
+// Callers reacting to a message pass msg.thread_ts (undefined for a top-level message), never
+// msg.ts: an ephemeral reply threaded under a message that has no visible replies yet is
+// unreachable — Slack shows no thread to open — so the user would see no response at all.
 
 async function sendConnectPrompt(client: any, channel: string, user: string, threadTs: string | undefined, message: string): Promise<void> {
   const url = await createConnectUrl(user);
@@ -347,7 +351,7 @@ async function ensureOwner(client: any, channel: string, actor: string, owner: s
 }
 
 async function handleConnect(msg: any, client: any) {
-  const threadTs = msg.thread_ts || msg.ts;
+  const threadTs = msg.thread_ts;
   try {
     const existing = await getLinkedInAccount(msg.user);
     const message = existing
@@ -361,7 +365,7 @@ async function handleConnect(msg: any, client: any) {
 }
 
 async function handleDisconnect(msg: any, client: any) {
-  const threadTs = msg.thread_ts || msg.ts;
+  const threadTs = msg.thread_ts;
   try {
     const removed = await disconnectLinkedInAccount(msg.user);
     await client.chat.postEphemeral({
@@ -443,7 +447,7 @@ async function handleCalendarTrigger(msg: any, client: any) {
   const threadTs = msg.thread_ts || msg.ts;
 
   try {
-    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, threadTs))) return;
+    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, msg.thread_ts))) return;
 
     await saveAwaitingCalendarTopic({
       channel: msg.channel,
@@ -743,7 +747,7 @@ async function handleEditTrigger(msg: any, client: any) {
   const threadTs = msg.thread_ts || msg.ts;
 
   try {
-    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, threadTs))) return;
+    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, msg.thread_ts))) return;
 
     const posts = await listPublishedPosts(msg.user, EDIT_POST_PICKER_LIMIT);
     if (posts.length === 0) {
@@ -921,7 +925,7 @@ async function handleTrigger(msg: any, client: any) {
   const threadTs = msg.thread_ts || msg.ts;
 
   try {
-    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, threadTs))) return;
+    if (!(await requireLinkedInAccount(client, msg.channel, msg.user, msg.thread_ts))) return;
 
     let threadContext: string | undefined;
     if (msg.thread_ts) {
