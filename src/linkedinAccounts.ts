@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
 import { config } from "./config.js";
 import { redis } from "./store.js";
 
@@ -36,9 +36,13 @@ const oauthStateKey = (state: string) => `linkedin-oauth-state:${state}`;
 // ---- Token encryption (AES-256-GCM). A Redis dump alone is then not enough to post as
 // anyone — the key lives only in the deployment's env vars. ----
 
+// Without an explicit TOKEN_ENCRYPTION_KEY, derive one from the Slack signing secret — already a
+// required deployment secret — so connecting LinkedIn works with no extra setup. Either way the
+// key never lives in Redis. Rotating whichever secret it comes from disconnects everyone (they
+// just connect again).
 function encryptionKey(): Buffer {
   if (!config.tokenEncryptionKey) {
-    throw new Error("TOKEN_ENCRYPTION_KEY is not set — it's needed to store LinkedIn connections. See README.");
+    return Buffer.from(hkdfSync("sha256", config.slackSigningSecret, "", "linkedin-token-encryption", 32));
   }
   const key = Buffer.from(config.tokenEncryptionKey, "base64");
   if (key.length !== 32) throw new Error("TOKEN_ENCRYPTION_KEY must be 32 bytes, base64-encoded.");
@@ -154,7 +158,14 @@ export async function getLinkedInAccount(slackUserId: string): Promise<LinkedInA
   const stored = await redis.get<StoredLinkedInAccount>(accountKey(slackUserId));
   if (stored) {
     const { encryptedAccessToken, ...rest } = stored;
-    return { ...rest, accessToken: decrypt(encryptedAccessToken) };
+    try {
+      return { ...rest, accessToken: decrypt(encryptedAccessToken) };
+    } catch (err) {
+      // Encrypted under a key that has since changed — unusable, so drop it and treat this
+      // person as not connected, which sends them the connect button instead of an error.
+      console.warn(`Dropping undecryptable LinkedIn token for ${slackUserId}:`, err);
+      await redis.del(accountKey(slackUserId));
+    }
   }
 
   if (slackUserId === config.linkedinOwnerSlackUserId && config.linkedinAccessToken && config.linkedinPersonId) {

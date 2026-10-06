@@ -102,7 +102,7 @@ Fill in `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `LLM_PROV
 
 Also set:
 
-- `TOKEN_ENCRYPTION_KEY`: 32 random bytes, base64. Every stored LinkedIn token is encrypted with it. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. If you change it later, everyone is disconnected and has to connect again.
+- `TOKEN_ENCRYPTION_KEY` (optional): 32 random bytes, base64. Every stored LinkedIn token is encrypted with it. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. If unset, a key is derived from `SLACK_SIGNING_SECRET`. If the key changes later (including by rotating the signing secret), everyone is shown the Connect button again and simply reconnects.
 - `APP_BASE_URL`: your stable production URL. The LinkedIn redirect URL is built from it (`$APP_BASE_URL/api/linkedin/callback`). Alternatively, set `LINKEDIN_REDIRECT_URI` directly.
 
 **Upgrading from the single-account setup?** Keep `LINKEDIN_ACCESS_TOKEN` / `LINKEDIN_PERSON_ID` and add `LINKEDIN_OWNER_SLACK_USER_ID` (your Slack member ID: profile → ⋮ → *Copy member ID*). That person keeps posting with the old token, and keeps their old "edit post" history, until they say "connect linkedin" themselves. After that, the `.env` token is no longer used. `npm run linkedin-auth` still works for producing such a token, but it's no longer needed.
