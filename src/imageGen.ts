@@ -28,6 +28,9 @@ const POSTER_FORMATS = {
   stat: "Key-number card: one figure from the post set enormous as the focal point, a short label directly under it, and the headline above or below. Like a premium annual-report data page.",
   contrast: "Two-part comparison: the canvas split into two clearly labelled halves (for example what was announced versus what people actually experience), each with a 1 to 4 word label and a simple visual, and the headline across the top.",
   framework: "Simple framework: the headline on top and three numbered steps or pillars below it, each a 1 to 4 word label with a minimal line icon, laid out on a clean grid.",
+  misconception: "Myth versus reality: a common belief shown struck through or visibly crossed out, with the reality beneath it given clear visual weight, and the headline above. Each side a 1 to 4 word label.",
+  "cause-effect": "Cause and effect: two labelled elements joined by one strong, deliberate connector (a single arrow, line, or chain link) showing that one leads to the other, with the headline above.",
+  timeline: "Timeline: three labelled points along one clean horizontal or vertical line showing how something has moved or will move, with the headline above. Each label 1 to 4 words.",
   editorial: "Editorial illustration: a conceptual flat illustration in premium business-magazine style filling about 60% of the canvas, with the headline in a clean band of solid colour above or below it.",
 } as const;
 
@@ -51,6 +54,8 @@ type Palette = keyof typeof PALETTES;
  * makes it come out with one clear, correctly spelled message.
  */
 interface ArtBrief {
+  /** The one idea a viewer should grasp within two seconds — everything else on the poster serves it. */
+  coreIdea: string;
   format: PosterFormat;
   palette: Palette;
   headline: string;
@@ -87,20 +92,26 @@ ${postText}
 
 Topic: "${topic}"
 
-Pick the format that best fits this post's central point:
+Start with the core idea. The graphic must not summarize the post, turn it into an infographic, or
+copy its sentences. It communicates ONE idea: the most surprising, useful, contested, or memorable
+insight in the post, the one a viewer should understand within two seconds even if they never read
+the post. Decide that first, then design everything around it.
+
+Pick the format that best fits that idea:
 ${Object.entries(POSTER_FORMATS).map(([key, description]) => `- "${key}": ${description}`).join("\n")}
-Use "stat" only if the post contains a striking number, and "contrast" only if the post really sets two things against each other.
+Only pick a format the post genuinely supports: "stat" needs a striking number in the post, "contrast" and "misconception" need two things the post really sets against each other, "cause-effect" needs a causal link the post actually makes, and "timeline" needs a sequence the post describes.
 
 Pick the palette that fits the topic's mood:
 ${Object.entries(PALETTES).map(([key, description]) => `- "${key}": ${description}`).join("\n")}
 
 Produce these fields:
+- "coreIdea": the one idea, in a single plain sentence.
 - "format": one of the format keys above.
 - "palette": one of the palette keys above.
 - "headline": the poster's main line, 3 to 7 words, a sharp take on the post's central claim that makes sense on its own. Not a label or a topic name ("AI Agents Update" is a label; "Agents now need your passwords" is a headline). No trailing period, no quotation marks, no emoji, no hashtags.
 - "subhead": one supporting line of at most 9 words, or "" if the headline stands on its own.
-- "labels": the other words the chosen format needs, and nothing else. For "stat": [the number exactly as in the post, a label of at most 5 words]. For "contrast": [left label, right label], 1 to 4 words each. For "framework": three labels of 1 to 4 words each. For "statement" and "editorial": [].
-- "visual": two or three sentences of concrete art direction: the specific visual metaphor or graphic for this post (be inventive and specific to the topic, not a generic phone, brain, globe, or circuit), and how it is composed with the text.
+- "labels": the other words the chosen format needs, and nothing else. For "stat": [the number exactly as in the post, a label of at most 5 words]. For "contrast", "misconception", and "cause-effect": [first label, second label], 1 to 4 words each. For "framework" and "timeline": three labels of 1 to 4 words each. For "statement" and "editorial": []. Only include labels the visual genuinely needs.
+- "visual": two or three sentences of concrete art direction: the specific visual metaphor or composition that makes the core idea obvious at a glance (be inventive and specific to this post, not a generic phone, brain, globe, or circuit), and how it is composed with the text. Every graphic element must carry meaning; nothing purely decorative.
 - "altText": a plain description of the finished graphic for screen readers, at most ${MAX_ALT_TEXT_CHARS} characters, written as a complete sentence.
 
 Hard rules:
@@ -111,7 +122,7 @@ Hard rules:
 
 Output format — read carefully:
 - Respond with ONLY a JSON object, nothing else. No preamble, no markdown fences.
-- Shape: {"format": "...", "palette": "...", "headline": "...", "subhead": "...", "labels": ["..."], "visual": "...", "altText": "..."}`;
+- Shape: {"coreIdea": "...", "format": "...", "palette": "...", "headline": "...", "subhead": "...", "labels": ["..."], "visual": "...", "altText": "..."}`;
 
   const brief = parseJsonFromModel<Partial<ArtBrief>>(await generateFromPrompt(prompt), "the poster art brief");
 
@@ -123,6 +134,8 @@ Output format — read carefully:
   }
 
   return {
+    // Optional for the same reason as altText below: the headline already carries the idea.
+    coreIdea: typeof brief.coreIdea === "string" && brief.coreIdea.trim() ? brief.coreIdea.trim() : brief.headline.trim(),
     // Unknown values fall back to the safest format and palette rather than failing the poster.
     format: brief.format && brief.format in POSTER_FORMATS ? brief.format : "statement",
     palette: brief.palette && brief.palette in PALETTES ? brief.palette : "paper",
@@ -149,7 +162,10 @@ function composeImagePrompt(brief: ArtBrief, fixes: string[] = []): string {
     ? `Use exactly these brand colours and nothing louder: ${config.posterBrandColors}. The first is the background, the second the text, any others accents.`
     : `Palette: ${PALETTES[brief.palette]}. Use these colours only, plus tints of them.`;
 
-  return `Design a premium, professional social media graphic for a LinkedIn post. It must look like the work of a top-tier brand design studio: the quality of a business magazine cover or a well-designed annual report, not a template or generic AI art.
+  return `Design a premium, professional social media graphic for a LinkedIn post. It must look like the work of a top-tier editorial design studio: think business magazine cover, not social media template. It should feel intelligent, confident, minimal, and instantly understandable.
+
+THE ONE IDEA IT MUST COMMUNICATE: ${brief.coreIdea}
+A viewer who never reads the post should still get this idea from the graphic within two seconds.
 
 FORMAT: ${POSTER_FORMATS[brief.format]}
 
@@ -163,10 +179,11 @@ COLOUR: ${palette}
 DESIGN REQUIREMENTS:
 - Typography: a modern geometric or grotesk sans-serif, heavy weight for the headline, set large (the headline should be clearly readable when the whole image is shrunk to a 300-pixel-wide thumbnail). Tight but even letter spacing, strong hierarchy: headline, then subhead, then labels much smaller.
 - Layout: a clear grid with generous margins (at least 7% of the width on every side) and plenty of negative space. Every word sits well inside the frame and is never clipped.
-- Graphics: flat vector, bold simple shapes, clean lines, optionally subtle grain or paper texture. Few elements, each one deliberate.
-- No text other than the words above: no captions, tiny labels, axis text, body copy, placeholder or lorem ipsum text, invented numbers, watermarks, signatures, page numbers, URLs, or handles.
+- Graphics: flat vector, bold simple shapes, clean geometry, editorial composition. Graphics support the idea rather than decorate it. Subtle paper grain only if it adds to the premium feel. Gradients only if extremely subtle. Few elements, each one deliberate, no clutter.
+- No text other than the words above: no captions, explanations, tiny labels, axis text, body copy, source names, article titles, dates, hashtags, placeholder or lorem ipsum text, invented numbers, watermarks, signatures, page numbers, URLs, usernames, or handles.
 - No logos or brand marks. No recognisable real person and no photorealistic human faces.
-- Avoid AI-art cliches: no glowing neon, no lens flares, no holograms, no floating app icons, no circuit boards, no robot heads, no glowing brains, no generic phone or laptop mockups, no handshakes or stock-photo business people.
+- It must NOT look like a Canva template, a stock social media graphic, an infographic, a presentation slide, a motivational quote card, or a technology advertisement.
+- Avoid AI-art cliches: no glowing neon, lens flares, holograms, robots or robot heads, glowing brains, circuit boards, floating app icons, generic phones or laptops, decorative UI screens, fake dashboards, fake charts, 3D corporate objects, arrows everywhere, unnecessary icons, clip-art, emoji, cartoon characters, handshakes, or stock-photo business people.
 - The design fills the whole image edge to edge. No border, frame, drop shadow, or mockup of a poster on a wall.${fixes.length ? `\n\nA previous attempt had these problems. Make sure this one does not:\n${fixes.map((f) => `- ${f}`).join("\n")}` : ""}`;
 }
 
@@ -333,6 +350,8 @@ Fail it for any of these:
 - It looks cheap, cluttered, distorted, or like generic AI art (glowing neon, floating icons, warped shapes) rather than professional design.
 - Any logo, watermark, or realistic human face.
 - The visual doesn't fit the post: a reader who sees the poster and then reads the post would find them unrelated, or the image suggests something the post doesn't say.
+- Someone who never reads the post would not get this idea from the poster within two seconds: "${brief.coreIdea}"
+- It looks like a Canva template, stock social graphic, infographic, presentation slide, motivational quote card, or tech advert rather than a premium editorial graphic.
 
 Respond with ONLY a JSON object: {"pass": true or false, "problems": ["each specific problem, phrased as an instruction for the designer"]}`;
 
