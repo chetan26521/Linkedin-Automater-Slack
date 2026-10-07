@@ -61,9 +61,10 @@ Poster generation runs through Gemini's image model or OpenAI's `gpt-image-1`, i
 - `IMAGE_PROVIDER` — `gemini` or `openai`. Defaults to `gemini` when `GEMINI_API_KEY` is set, otherwise `openai`.
 - `GEMINI_API_KEY` / `OPENAI_API_KEY` — the chosen image provider's key, whichever provider writes the text. The same keys as the text-provider options above.
 - `POST_IMAGES` — `on` or `off`. Defaults to `on` when the image provider's key is set and `off` otherwise. Set it to `off` for text-only posts without having to remove the key.
-- `GEMINI_IMAGE_MODEL` — default `gemini-2.5-flash-image`.
+- `GEMINI_IMAGE_MODEL` — default `gemini-3-pro-image-preview`, which renders typography far better. It's paid-only; if the key can't use it, posters fall back to `GEMINI_IMAGE_FALLBACK_MODEL` (default `gemini-2.5-flash-image`).
+- `POSTER_BRAND_COLORS` — optional comma-separated hex colours (background, text, accents) used on every poster instead of the built-in palettes.
 - `OPENAI_IMAGE_MODEL` — default `gpt-image-1`, OpenAI's current image model, which renders legible text well (the whole point of a poster).
-- `POST_IMAGE_ASPECT_RATIO` — default `1:1`, which fills more of a mobile feed than a `1.91:1` banner without risking the crop that portrait ratios get in some LinkedIn surfaces. `gpt-image-1` only supports square/landscape/portrait sizes, so this is mapped to the closest of the three rather than passed through as an arbitrary ratio.
+- `POST_IMAGE_ASPECT_RATIO` — default `4:5`, the largest shape LinkedIn shows uncropped in the mobile feed. `gpt-image-1` only supports square/landscape/portrait sizes, so this is mapped to the closest of the three rather than passed through as an arbitrary ratio.
 
 ## 3. Create the Slack app
 

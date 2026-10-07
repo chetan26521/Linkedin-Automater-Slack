@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { researchTopic, type ResearchResult } from "./research.js";
 
 export interface GeneratedPost {
   postText: string;
@@ -160,7 +161,7 @@ const AI_TELL_RULES = `- Never use stock AI-sounding vocabulary, including: ${AI
 - Anchor the post in at least one concrete specific (a number, a named tool or company, a moment, a real constraint) rather than general claims. But never invent personal anecdotes, clients, results, or numbers about the author: if the request doesn't supply them, frame it as an observation or opinion, not a story that didn't happen.
 - Have an actual opinion. A small, specific stance or a mild admission of doubt reads human; hedged, balanced "both sides have merit" summaries read like AI.
 - No rhetorical question-then-answer reveals ("The result? ...", "Why does this matter? Because ..."), no colon cliffhangers ("Here's what I learned:"), and no "Let that sink in."
-- Do not end with generic engagement bait ("Thoughts?", "Agree?", "What do you think?", "Drop a comment below"). End on the point itself, or one genuinely specific question only if it arises naturally.
+- Do not end with generic engagement bait ("Thoughts?", "Agree?", "What do you think?", "Drop a comment below"). End on the point itself, or on one specific question that practitioners could answer from their own experience.
 - Do not make every line its own paragraph. Mix one-line paragraphs with paragraphs of two or three sentences.
 - At most one emoji in the whole post, and none as bullet points or line starters. No bold or italic unicode lettering.`;
 
@@ -227,12 +228,19 @@ before you respond.`;
 
 // Shared by generatePostText and revisePublishedPost, so a formatting rule only needs to be
 // stated once.
+//
+// The reach rules follow how LinkedIn's feed actually ranks posts: only the first ~200 characters
+// show before "...see more", so the opening decides whether anyone expands it; time spent reading
+// and substantive comments count for far more than likes; and posts with outbound links get less
+// distribution (sources are shown in Slack instead, never in the post).
 const POST_FORMAT_RULES = `Rules for the post:
-- Open with a meaningful, specific observation that fits the topic. No manufactured hook.
-- Short paragraphs, plain language, sounds like a real person (not corporate marketing copy).
+- The first two lines (about 200 characters, all a reader sees before "...see more") must give a reason to keep reading: a specific, surprising fact, a real tension, or a clear stance drawn from the research. Earn the click with substance, never clickbait or a manufactured hook.
+- Give the reader something they can't get from the headline: a practical implication, a specific detail, or a non-obvious angle. That is what keeps people reading and gets the post saved and shared.
+- Short paragraphs with white space between them, readable on a phone. Plain language that sounds like a real person, not corporate marketing copy.
 ${AI_TELL_RULES}
 - 0-3 relevant hashtags max, only at the very end.
-- 80-200 words.
+- 150-280 words.
+- No links in the post body.
 
 ${OUTPUT_FORMAT_RULES}`;
 
@@ -541,28 +549,62 @@ async function finalizePost(draftText: string): Promise<string> {
   return text;
 }
 
+// Multi-platform research (src/research.ts) needs Anthropic's server-side search tools. Any
+// failure there falls back to the single search-grounded call, so a research outage costs
+// quality, not the whole post.
+async function tryResearch(topic: string, threadContext?: string): Promise<ResearchResult | undefined> {
+  if (config.llmProvider !== "anthropic") return undefined;
+  try {
+    return await researchTopic(topic, threadContext);
+  } catch (err) {
+    console.error("Multi-platform research failed, falling back to single-pass search:", err);
+    return undefined;
+  }
+}
+
 // skipHumanize exists only for scripts/check-ai-detection.ts, to measure what the humanize
 // pass actually buys — not used anywhere in the Slack app flow.
 export async function generatePostText(topic: string, contentStyle: ContentStyle, threadContext?: string, refinement?: Refinement, skipHumanize = false): Promise<GeneratedPost> {
   const styleInstruction = CONTENT_STYLES.find((s) => s.style === contentStyle)?.instruction;
   const refinementInstruction = refinement && REFINEMENT_STYLES.find((r) => r.style === refinement.style)?.instruction;
 
+  const research = await tryResearch(topic, threadContext);
+
+  const researchSection = research
+    ? `Research gathered for this post from the official source, practitioner communities, social
+platforms, and independent analysts:
+"""
+${research.brief}
+"""
+
+How to use the research:
+- Build the post on the facts and on what people are actually saying, not on what the topic sounds like.
+- Skip the takes listed as overused. Look hardest at the underexplored angles and at where the
+  official claims and real user experience don't match: that gap is usually the post.
+- Write as a practitioner who has read all of this and has a view on it. The author can speak in the
+  first person about what they're seeing in the conversation ("the complaint I keep seeing", "what
+  most coverage skips") because that comes from real research. Never invent hands-on use, clients,
+  or results the request didn't provide.
+- Only use facts that appear in the research or the request.`
+    : `Before writing, if you have web search available, use it at least once — even for a topic that
+feels evergreen or already well within your knowledge. Find a concrete, current fact, statistic,
+example, or notable discussion to ground the post in (industry write-ups, recent news, posts from
+recognized voices in the space). Search again if the first result isn't useful, or if the topic
+would benefit from more than one angle. Only skip searching entirely if no search tool is
+available to you.`;
+
   const prompt = `You are ghostwriting a LinkedIn post for a professional building their personal brand.
+Today's date is ${new Date().toISOString().slice(0, 10)}.
 
 Request from Slack:
 "${topic}"
-${threadContext ? `\nAdditional context from the Slack thread:\n${threadContext}` : ""}
+${threadContext ? `\nAdditional context from the Slack thread (if it includes the author's own experience or opinion, build the post around it):\n${threadContext}` : ""}
 
 Content style: ${styleInstruction}
 
 ${HUMAN_WRITING_GUIDE}
 
-Before writing, if you have web search available, use it at least once — even for a topic that
-feels evergreen or already well within your knowledge. Find a concrete, current fact, statistic,
-example, or notable discussion to ground the post in (industry write-ups, recent news, posts from
-recognized voices in the space). Search again if the first result isn't useful, or if the topic
-would benefit from more than one angle. Only skip searching entirely if no search tool is
-available to you.
+${researchSection}
 
 ${POST_FORMAT_RULES}
 ${
@@ -571,7 +613,7 @@ ${
     : ""
 }`;
 
-  const draft = await generateGroundedPost(prompt);
+  const draft = research ? { postText: await generateFromPrompt(prompt), sources: research.sources } : await generateGroundedPost(prompt);
   if (skipHumanize) return draft;
   return { postText: await finalizePost(draft.postText), sources: draft.sources };
 }

@@ -69,10 +69,17 @@ export const config = {
   imageProvider,
   postImages: (process.env.POST_IMAGES ?? (imageProviderKey ? "on" : "off")).toLowerCase() !== "off",
   openaiImageModel: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1",
-  geminiImageModel: process.env.GEMINI_IMAGE_MODEL ?? "gemini-2.5-flash-image",
-  // 1:1 fills more of a mobile LinkedIn feed than a 1.91:1 banner without risking the
-  // crop that portrait ratios get in some LinkedIn surfaces.
-  postImageAspectRatio: process.env.POST_IMAGE_ASPECT_RATIO ?? "1:1",
+  // The Pro image model renders typography and layout far better than Flash — the difference
+  // between a poster you'd publish and one you wouldn't. It's paid-only, so a key that can't
+  // use it falls back to the Flash model automatically (see callGeminiImage).
+  geminiImageModel: process.env.GEMINI_IMAGE_MODEL ?? "gemini-3-pro-image-preview",
+  geminiImageFallbackModel: process.env.GEMINI_IMAGE_FALLBACK_MODEL ?? "gemini-2.5-flash-image",
+  // Optional comma-separated hex colours (background, text, accents) that replace the built-in
+  // poster palettes, for a consistent brand look across every post.
+  posterBrandColors: process.env.POSTER_BRAND_COLORS ?? "",
+  // 4:5 portrait is the largest shape LinkedIn shows uncropped in the mobile feed, so the
+  // poster takes up the most screen space a single image can.
+  postImageAspectRatio: process.env.POST_IMAGE_ASPECT_RATIO ?? "4:5",
   // Legacy single-account credentials from `npm run linkedin-auth`. Only used as a fallback
   // for LINKEDIN_OWNER_SLACK_USER_ID until that person connects through Slack themselves —
   // everyone else's tokens live per-user in Redis (see src/linkedinAccounts.ts).

@@ -18,14 +18,45 @@ export interface PostImage {
 }
 
 /**
+ * The poster formats that consistently perform in a LinkedIn feed. Picking one of these up front
+ * — instead of asking for "a professional poster" — is what stops the image model falling back to
+ * its default: a dark background, a glowing centred icon, and small text, which reads as generic
+ * AI art and gets scrolled past.
+ */
+const POSTER_FORMATS = {
+  statement: "Bold typographic statement: the headline set very large across the upper half, left-aligned, with one simple graphic shape or motif that echoes the idea. Typography is the hero.",
+  stat: "Key-number card: one figure from the post set enormous as the focal point, a short label directly under it, and the headline above or below. Like a premium annual-report data page.",
+  contrast: "Two-part comparison: the canvas split into two clearly labelled halves (for example what was announced versus what people actually experience), each with a 1 to 4 word label and a simple visual, and the headline across the top.",
+  framework: "Simple framework: the headline on top and three numbered steps or pillars below it, each a 1 to 4 word label with a minimal line icon, laid out on a clean grid.",
+  editorial: "Editorial illustration: a conceptual flat illustration in premium business-magazine style filling about 60% of the canvas, with the headline in a clean band of solid colour above or below it.",
+} as const;
+
+type PosterFormat = keyof typeof POSTER_FORMATS;
+
+// Restrained palettes the art director picks from, so posters look deliberate and varied across
+// a feed without drifting into neon. POSTER_BRAND_COLORS overrides all of them.
+const PALETTES = {
+  paper: "warm off-white background (#F6F3EE), near-black text (#141414), one vivid accent (#FF5A1F)",
+  navy: "deep navy background (#0E1A2B), white text, one warm accent (#F5B700)",
+  clean: "pure white background, dark blue-black text (#0A2540), one bright accent (#2F6BFF)",
+  forest: "deep green background (#0F2E24), cream text (#F4EFE3), one soft accent (#9FE2BF)",
+} as const;
+
+type Palette = keyof typeof PALETTES;
+
+/**
  * Art direction for one poster. Generated as its own step rather than handing the whole post
  * to the image model, because image models given a wall of prose either try to render all of
- * it or pick an arbitrary fragment — deciding the headline in text first is what makes the
- * poster come out with one clear, correctly spelled message.
+ * it or pick an arbitrary fragment — deciding every word on the poster in text first is what
+ * makes it come out with one clear, correctly spelled message.
  */
 interface ArtBrief {
+  format: PosterFormat;
+  palette: Palette;
   headline: string;
   subhead: string;
+  /** Every other word allowed on the poster: the stat and its label, comparison labels, or step labels. */
+  labels: string[];
   visual: string;
   altText: string;
 }
@@ -47,7 +78,7 @@ export function assertImageGenConfigured(): void {
 }
 
 async function buildArtBrief(postText: string, topic: string): Promise<ArtBrief> {
-  const prompt = `You are the art director for a LinkedIn post that will be read by senior industry and government officials. Write the brief for a single poster graphic to accompany it.
+  const prompt = `You are the art director for a LinkedIn post that will be read by senior industry professionals. Design the single poster graphic that goes with it. Its job is to stop someone scrolling and make the post's main point instantly clear, even at thumbnail size on a phone.
 
 The post:
 """
@@ -56,20 +87,31 @@ ${postText}
 
 Topic: "${topic}"
 
+Pick the format that best fits this post's central point:
+${Object.entries(POSTER_FORMATS).map(([key, description]) => `- "${key}": ${description}`).join("\n")}
+Use "stat" only if the post contains a striking number, and "contrast" only if the post really sets two things against each other.
+
+Pick the palette that fits the topic's mood:
+${Object.entries(PALETTES).map(([key, description]) => `- "${key}": ${description}`).join("\n")}
+
 Produce these fields:
-- "headline": the poster's main line, 3 to 8 words, drawn from the post's actual central claim. No trailing period, no quotation marks, no emoji, no hashtags.
-- "subhead": one supporting line of at most 10 words, or "" if the headline stands on its own. Same restrictions.
-- "visual": one or two sentences of art direction — the concrete subject or visual metaphor, the composition, and the colour palette. Describe an abstract, geometric, or diagrammatic visual rather than people or photography.
+- "format": one of the format keys above.
+- "palette": one of the palette keys above.
+- "headline": the poster's main line, 3 to 7 words, a sharp take on the post's central claim that makes sense on its own. Not a label or a topic name ("AI Agents Update" is a label; "Agents now need your passwords" is a headline). No trailing period, no quotation marks, no emoji, no hashtags.
+- "subhead": one supporting line of at most 9 words, or "" if the headline stands on its own.
+- "labels": the other words the chosen format needs, and nothing else. For "stat": [the number exactly as in the post, a label of at most 5 words]. For "contrast": [left label, right label], 1 to 4 words each. For "framework": three labels of 1 to 4 words each. For "statement" and "editorial": [].
+- "visual": two or three sentences of concrete art direction: the specific visual metaphor or graphic for this post (be inventive and specific to the topic, not a generic phone, brain, globe, or circuit), and how it is composed with the text.
 - "altText": a plain description of the finished graphic for screen readers, at most ${MAX_ALT_TEXT_CHARS} characters, written as a complete sentence.
 
 Hard rules:
-- Use a number, statistic, date, or proper noun in "headline" or "subhead" ONLY if it appears in the post above. Never invent a figure — this is going in front of an audience that will check.
-- No company, product, or brand names unless they appear in the post.
-- Keep it sober and credible: no hype words ("revolutionary", "game-changer", "unlock"), no exclamation marks.
+- Use a number, statistic, date, or proper noun ONLY if it appears in the post above. Never invent a figure — this audience will check.
+- Product or company names only if they appear in the post.
+- Sober and credible: no hype words ("revolutionary", "game-changer", "unlock"), no exclamation marks.
+- Keep the total words across headline, subhead, and labels under 22. Fewer words looks more confident.
 
 Output format — read carefully:
 - Respond with ONLY a JSON object, nothing else. No preamble, no markdown fences.
-- Shape: {"headline": "...", "subhead": "...", "visual": "...", "altText": "..."}`;
+- Shape: {"format": "...", "palette": "...", "headline": "...", "subhead": "...", "labels": ["..."], "visual": "...", "altText": "..."}`;
 
   const brief = parseJsonFromModel<Partial<ArtBrief>>(await generateFromPrompt(prompt), "the poster art brief");
 
@@ -81,8 +123,12 @@ Output format — read carefully:
   }
 
   return {
+    // Unknown values fall back to the safest format and palette rather than failing the poster.
+    format: brief.format && brief.format in POSTER_FORMATS ? brief.format : "statement",
+    palette: brief.palette && brief.palette in PALETTES ? brief.palette : "paper",
     headline: brief.headline.trim(),
     subhead: typeof brief.subhead === "string" ? brief.subhead.trim() : "",
+    labels: Array.isArray(brief.labels) ? brief.labels.filter((l): l is string => typeof l === "string" && !!l.trim()).map((l) => l.trim()).slice(0, 3) : [],
     visual: brief.visual.trim(),
     // Alt text is the one field a weaker model can plausibly omit without the poster being
     // unusable, so fall back to the headline rather than failing the whole generation.
@@ -90,26 +136,38 @@ Output format — read carefully:
   };
 }
 
+function allowedText(brief: ArtBrief): string[] {
+  return [brief.headline, brief.subhead, ...brief.labels].filter(Boolean);
+}
+
 // The negative constraints below are doing most of the work here: left to their own devices,
 // image models fill professional-looking layouts with plausible body copy, invented chart
 // numbers, fake logos, and stock-photo handshakes — all of which read as obviously fake to
 // exactly the audience these posts are aimed at.
-function composeImagePrompt(brief: ArtBrief): string {
-  return `A single professional poster graphic for a LinkedIn feed, aimed at an audience of senior industry and government officials.
+function composeImagePrompt(brief: ArtBrief, fixes: string[] = []): string {
+  const palette = config.posterBrandColors
+    ? `Use exactly these brand colours and nothing louder: ${config.posterBrandColors}. The first is the background, the second the text, any others accents.`
+    : `Palette: ${PALETTES[brief.palette]}. Use these colours only, plus tints of them.`;
 
-Render exactly this text, spelled exactly as written, and no other words:
-HEADLINE: "${brief.headline}"${brief.subhead ? `\nSUBHEAD: "${brief.subhead}"` : ""}
+  return `Design a premium, professional social media graphic for a LinkedIn post. It must look like the work of a top-tier brand design studio: the quality of a business magazine cover or a well-designed annual report, not a template or generic AI art.
 
-Art direction: ${brief.visual}
+FORMAT: ${POSTER_FORMATS[brief.format]}
 
-Design requirements:
-- Editorial, corporate-professional design language: clean geometric layout, clear typographic hierarchy, generous whitespace, a restrained palette of two or three colours plus neutrals.
-- The headline is the dominant element and must stay perfectly legible at thumbnail size on a phone: crisp, evenly spaced, modern sans-serif type, well inside the frame and never clipped at an edge.
-- Flat vector, subtle gradient, isometric, or abstract diagrammatic illustration.
-- Render NO text other than the headline and subhead above: no captions, labels, axis text, body copy, placeholder or lorem-ipsum text, invented statistics, watermarks, signatures, page numbers, or URLs.
+TEXT. Render exactly these words, spelled exactly as written, and no other words anywhere in the image:
+HEADLINE: "${brief.headline}"${brief.subhead ? `\nSUBHEAD: "${brief.subhead}"` : ""}${brief.labels.length ? `\nLABELS: ${brief.labels.map((l) => `"${l}"`).join(", ")}` : ""}
+
+ART DIRECTION: ${brief.visual}
+
+COLOUR: ${palette}
+
+DESIGN REQUIREMENTS:
+- Typography: a modern geometric or grotesk sans-serif, heavy weight for the headline, set large (the headline should be clearly readable when the whole image is shrunk to a 300-pixel-wide thumbnail). Tight but even letter spacing, strong hierarchy: headline, then subhead, then labels much smaller.
+- Layout: a clear grid with generous margins (at least 7% of the width on every side) and plenty of negative space. Every word sits well inside the frame and is never clipped.
+- Graphics: flat vector, bold simple shapes, clean lines, optionally subtle grain or paper texture. Few elements, each one deliberate.
+- No text other than the words above: no captions, tiny labels, axis text, body copy, placeholder or lorem ipsum text, invented numbers, watermarks, signatures, page numbers, URLs, or handles.
 - No logos or brand marks. No recognisable real person and no photorealistic human faces.
-- No stock-photo cliches: no handshakes, no boardroom photography, no people pointing at charts, no glowing blue circuit boards or "digital brain" backgrounds.
-- The design bleeds to the edges of the image. No outer border, frame, drop shadow, or mockup of a printed poster on a wall — the image itself IS the poster.`;
+- Avoid AI-art cliches: no glowing neon, no lens flares, no holograms, no floating app icons, no circuit boards, no robot heads, no glowing brains, no generic phone or laptop mockups, no handshakes or stock-photo business people.
+- The design fills the whole image edge to edge. No border, frame, drop shadow, or mockup of a poster on a wall.${fixes.length ? `\n\nA previous attempt had these problems. Make sure this one does not:\n${fixes.map((f) => `- ${f}`).join("\n")}` : ""}`;
 }
 
 // gpt-image-1 only takes discrete sizes, not an arbitrary aspect ratio — map the
@@ -152,8 +210,8 @@ async function callOpenAiImage(prompt: string): Promise<{ bytes: Buffer; mimeTyp
   return { bytes: Buffer.from(b64, "base64"), mimeType: "image/png" };
 }
 
-function requestGeminiImage(body: string): Promise<Response> {
-  return fetch(`${GEMINI_API_BASE}/${config.geminiImageModel}:generateContent`, {
+function requestGeminiImage(model: string, body: string): Promise<Response> {
+  return fetch(`${GEMINI_API_BASE}/${model}:generateContent`, {
     method: "POST",
     headers: {
       "x-goog-api-key": config.geminiApiKey,
@@ -168,30 +226,35 @@ interface GeminiImagePart {
   inlineData?: { mimeType?: string; data?: string };
 }
 
-async function callGeminiImage(prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
-  const buildBody = (withImageConfig: boolean) =>
-    JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      ...(withImageConfig ? { generationConfig: { imageConfig: { aspectRatio: config.postImageAspectRatio } } } : {}),
-    });
+async function callGeminiImageWithModel(model: string, prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
+  // Most to least specific: the Pro image models take an output resolution, older ones only an
+  // aspect ratio, and the oldest reject imageConfig outright (a 400, not an ignored field). Step
+  // down on each rejection so a GEMINI_IMAGE_MODEL override can't hard-fail on one knob.
+  const imageConfigs: (Record<string, string> | undefined)[] = [
+    { aspectRatio: config.postImageAspectRatio, imageSize: "2K" },
+    { aspectRatio: config.postImageAspectRatio },
+    undefined,
+  ];
 
-  let response = await requestGeminiImage(buildBody(true));
-
-  // generationConfig.imageConfig is only understood by the newer image models; the ones that
-  // don't know it reject the whole request with a 400 rather than ignoring the field. Retry
-  // without it so a GEMINI_IMAGE_MODEL override can't hard-fail on one unsupported knob —
-  // the poster just comes out in that model's default aspect ratio instead.
-  if (response.status === 400) {
+  let response: Response | undefined;
+  for (const imageConfig of imageConfigs) {
+    response = await requestGeminiImage(
+      model,
+      JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        ...(imageConfig ? { generationConfig: { imageConfig } } : {}),
+      })
+    );
+    if (response.status !== 400) break;
     const detail = await response.text();
-    if (!/imageconfig|aspect/i.test(detail)) {
+    if (!/image_?config|image_?size|aspect/i.test(detail)) {
       throw new Error(`Gemini image API failed: 400 ${detail}`);
     }
-    console.warn(`Gemini image model rejected imageConfig, retrying without it: ${detail.slice(0, 300)}`);
-    response = await requestGeminiImage(buildBody(false));
+    console.warn(`Gemini image model ${model} rejected an image setting, retrying with fewer: ${detail.slice(0, 300)}`);
   }
 
-  if (!response.ok) {
-    throw new Error(`Gemini image API failed: ${response.status} ${await response.text()}`);
+  if (!response || !response.ok) {
+    throw new GeminiHttpError(response?.status ?? 0, response ? await response.text() : "no response");
   }
 
   const json = (await response.json()) as {
@@ -219,11 +282,112 @@ async function callGeminiImage(prompt: string): Promise<{ bytes: Buffer; mimeTyp
   return { bytes: Buffer.from(image.data, "base64"), mimeType: image.mimeType ?? "image/png" };
 }
 
-/** Generates a poster graphic for a finished post. Two model calls: art brief, then image. */
+class GeminiHttpError extends Error {
+  constructor(readonly status: number, detail: string) {
+    super(`Gemini image API failed: ${status} ${detail}`);
+  }
+}
+
+// The Pro image model is paid-only and not enabled on every key, so a key that can't use it
+// (not found, no permission, or no quota) still gets a poster from the fallback model instead
+// of an error.
+async function callGeminiImage(prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
+  try {
+    return await callGeminiImageWithModel(config.geminiImageModel, prompt);
+  } catch (err) {
+    const fallback = config.geminiImageFallbackModel;
+    if (!(err instanceof GeminiHttpError) || ![403, 404, 429].includes(err.status) || !fallback || fallback === config.geminiImageModel) throw err;
+    console.warn(`Gemini image model ${config.geminiImageModel} unavailable (${err.status}), falling back to ${fallback}`);
+    return callGeminiImageWithModel(fallback, prompt);
+  }
+}
+
+function generateImage(prompt: string): Promise<{ bytes: Buffer; mimeType: string }> {
+  return config.imageProvider === "gemini" ? callGeminiImage(prompt) : callOpenAiImage(prompt);
+}
+
+/**
+ * Has Claude look at the finished poster the way an editor would before it goes anywhere near
+ * LinkedIn. Image models still sometimes misspell a word, sneak in gibberish text, or fall back to
+ * a cheap-looking layout, and the brief can't prevent that — only looking at the result can.
+ * Returns the problems found (empty means it passed). Only runs when Claude is the text model;
+ * any failure of the review itself passes the poster rather than blocking it.
+ */
+async function reviewPoster(image: { bytes: Buffer; mimeType: string }, brief: ArtBrief, postText: string): Promise<string[]> {
+  if (config.llmProvider !== "anthropic") return [];
+
+  const prompt = `You are the final quality check for a poster that is about to be published on LinkedIn by a senior professional, alongside this post:
+"""
+${postText}
+"""
+
+Look at the poster critically.
+
+The only text allowed on it, spelled exactly like this:
+${allowedText(brief).map((t) => `- "${t}"`).join("\n")}
+
+Fail it for any of these:
+- Any allowed text is misspelled, has wrong or missing letters, is cut off, or is hard to read.
+- Any other text, letters, numbers, or gibberish appear anywhere.
+- The headline would not be readable as a small thumbnail.
+- It looks cheap, cluttered, distorted, or like generic AI art (glowing neon, floating icons, warped shapes) rather than professional design.
+- Any logo, watermark, or realistic human face.
+- The visual doesn't fit the post: a reader who sees the poster and then reads the post would find them unrelated, or the image suggests something the post doesn't say.
+
+Respond with ONLY a JSON object: {"pass": true or false, "problems": ["each specific problem, phrased as an instruction for the designer"]}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": config.anthropicApiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: config.anthropicModel,
+        max_tokens: 2000,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: image.mimeType, data: image.bytes.toString("base64") } },
+              { type: "text", text: prompt },
+            ],
+          },
+        ],
+      }),
+    });
+    if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+
+    const json = (await response.json()) as { content?: { type: string; text?: string }[] };
+    const raw = json.content?.find((b) => b.type === "text")?.text ?? "";
+    const verdict = parseJsonFromModel<{ pass?: boolean; problems?: string[] }>(raw, "the poster review");
+    return verdict.pass === false ? (verdict.problems?.length ? verdict.problems : ["The poster did not meet the quality bar."]) : [];
+  } catch (err) {
+    console.warn("Poster review failed, accepting the poster unreviewed:", err);
+    return [];
+  }
+}
+
+// One redo is the most the function's time budget comfortably allows on top of drafting the post.
+const MAX_POSTER_ATTEMPTS = 2;
+
+/**
+ * Generates a poster graphic for a finished post: an art brief, then the image, then a visual
+ * quality review with one redo that names the exact problems the reviewer found.
+ */
 export async function generatePostImage(postText: string, topic: string): Promise<PostImage> {
   assertImageGenConfigured();
   const brief = await buildArtBrief(postText, topic);
-  const prompt = composeImagePrompt(brief);
-  const { bytes, mimeType } = config.imageProvider === "gemini" ? await callGeminiImage(prompt) : await callOpenAiImage(prompt);
-  return { bytes, mimeType, altText: brief.altText, headline: brief.headline };
+
+  let image = await generateImage(composeImagePrompt(brief));
+  for (let attempt = 1; attempt < MAX_POSTER_ATTEMPTS; attempt++) {
+    const problems = await reviewPoster(image, brief, postText);
+    if (problems.length === 0) break;
+    console.warn(`Poster attempt ${attempt} failed review: ${problems.join("; ")}`);
+    image = await generateImage(composeImagePrompt(brief, problems));
+  }
+
+  return { ...image, altText: brief.altText, headline: brief.headline };
 }
