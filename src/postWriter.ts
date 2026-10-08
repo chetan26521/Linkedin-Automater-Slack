@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { researchTopic, type ResearchResult } from "./research.js";
+import { HUMAN_WRITING_GUIDE } from "./writingGuide.js";
 
 export interface GeneratedPost {
   postText: string;
@@ -98,18 +99,18 @@ export function findAiTells(text: string): string[] {
   const emojiCount = (text.match(/\p{Extended_Pictographic}/gu) ?? []).length;
   if (emojiCount > 1) issues.push(`Has ${emojiCount} emoji. Use at most one, or none.`);
 
+  // Readability over detector-evasion: an earlier version of these checks pushed for uneven
+  // sentence lengths and multi-sentence paragraphs, which produced dense, hard-to-read posts.
   const sentences = text.split(/(?<=[.?!])\s+/).map((s) => s.trim()).filter(Boolean);
-  if (sentences.length >= 4) {
-    const lengths = sentences.map((s) => s.split(/\s+/).length);
-    const mean = lengths.reduce((a, b) => a + b, 0) / lengths.length;
-    const stdDev = Math.sqrt(lengths.reduce((a, b) => a + (b - mean) ** 2, 0) / lengths.length);
-    if (mean > 0 && stdDev / mean < 0.3) issues.push("Sentence lengths are too uniform. Mix in a very short sentence and a longer, looser one.");
+  const longSentences = sentences.filter((s) => s.split(/\s+/).length > 30);
+  if (longSentences.length) {
+    issues.push(`Has ${longSentences.length} sentence(s) over 30 words, starting "${longSentences[0].split(/\s+/).slice(0, 8).join(" ")}...". Split each into shorter sentences.`);
   }
 
   const paragraphs = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  const oneLiners = paragraphs.filter((p) => !p.startsWith("#") && p.split(/(?<=[.?!])\s+/).length === 1).length;
-  if (paragraphs.length >= 5 && oneLiners / paragraphs.length > 0.7) {
-    issues.push("Almost every paragraph is a single line (\"broetry\"). Let some paragraphs hold two or three sentences together.");
+  const longParagraphs = paragraphs.filter((p) => p.split(/(?<=[.?!])\s+/).length > 3);
+  if (longParagraphs.length) {
+    issues.push(`Has ${longParagraphs.length} paragraph(s) with more than three sentences. Break them up so each paragraph holds one idea.`);
   }
 
   return issues;
@@ -152,17 +153,20 @@ const AI_TELL_RULES = `- Never use stock AI-sounding vocabulary, including: ${AI
 - Never start a sentence with a lone transition word like Moreover, Furthermore, Additionally, or However — real people rarely write that way.
 - Never use the "It's not just about X, it's about Y" / "This isn't X. It's Y." contrast template, or any close variant of it — it is one of the single most recognizable AI patterns.
 - Do not use em dashes, en dashes, or hyphens as a rhetorical pause or clause separator (e.g. avoid "the results were clear - and surprising"). Do not use backslashes or forward slashes as shorthand connectors (e.g. "and/or", "input/output") — spell things out in plain words instead.
-- Let sentence length follow the meaning: a short sentence where a point lands, a longer one where an idea needs room, the way a real person actually talks. Do not default to neatly balanced "X, Y, and Z" triads or give every paragraph the same rhythm, length, and structure. Perfect symmetry reads as machine-written.
+- Keep sentences simple: mostly short, with the occasional longer thought, and none over 30 words. Do not default to neatly balanced "X, Y, and Z" triads.
 - Do not repeat the same idea in different words, and do not wrap every point in dramatic language. A plain, clear statement is stronger.
 - Never add deliberate typos, grammar mistakes, or awkward wording to seem human. The writing should feel considered and natural, not artificially casual.
 - Use contractions naturally where a real person would (don't, it's, we've, wasn't) rather than unnaturally formal complete grammar throughout.
-- Do not lay out ideas as a tidy setup / three-part-list / neat-conclusion structure. Let it read like one specific person's actual train of thought, with a slightly uneven shape, not an outline filled in with sentences.
+- Use everyday words a smart person outside this field would understand. Avoid jargon and acronyms; if a technical term is unavoidable, explain it in a few plain words.
+- Don't pile hedges and qualifiers into sentences ("reportedly", "actually", "arguably", "in some cases"). If a fact is uncertain, leave it out, or say so once, plainly.
+- Use at most three numbers in the whole post. Pick the ones that matter most and make each one easy to picture.
+- A short list of 2 to 4 items is fine when it makes the post easier to scan.
 - Write in the first person, the way this person would say it out loud to a colleague (their voice and opinions, never invented experiences). Prefer the plain word over the impressive one ("use" not "utilize", "help" not "empower").
 - Anchor the post in at least one concrete specific (a number, a named tool or company, a moment, a real constraint) rather than general claims. But never invent personal anecdotes, clients, results, or numbers about the author: if the request doesn't supply them, frame it as an observation or opinion, not a story that didn't happen.
 - Have an actual opinion. A small, specific stance or a mild admission of doubt reads human; hedged, balanced "both sides have merit" summaries read like AI.
 - No rhetorical question-then-answer reveals ("The result? ...", "Why does this matter? Because ..."), no colon cliffhangers ("Here's what I learned:"), and no "Let that sink in."
-- Do not end with generic engagement bait ("Thoughts?", "Agree?", "What do you think?", "Drop a comment below"). End on the point itself, or on one specific question that practitioners could answer from their own experience.
-- Do not make every line its own paragraph. Mix one-line paragraphs with paragraphs of two or three sentences.
+- Do not end with generic engagement bait ("Thoughts?", "Agree?", "What do you think?", "Drop a comment below"). End with an insight that stays with the reader.
+- Keep paragraphs to one or two sentences, never more than three, with a blank line between them so the post is easy to read on a phone.
 - At most one emoji in the whole post, and none as bullet points or line starters. No bold or italic unicode lettering.`;
 
 const OUTPUT_FORMAT_RULES = `Output format — read carefully:
@@ -173,58 +177,6 @@ const OUTPUT_FORMAT_RULES = `Output format — read carefully:
 - Do not include URLs, footnote markers, or citation text inline in the post itself — sources
   are tracked and shown separately, not part of the published post body.
 - The first character of your response must be the first character of the post itself, and the last character must be the end of the post (its final word or hashtag).`;
-
-// The thinking-and-judgment half of the house style, adapted from the team's "human-like content"
-// master prompt: what to work out before writing, where the post's substance comes from, and how
-// to treat facts. AI_TELL_RULES covers the surface wording; this covers whether the post has
-// anything worth saying. Used by the drafting prompts (not the humanize pass, which only line-edits).
-const HUMAN_WRITING_GUIDE = `Write like an expert who knows this topic, has an opinion about it, and talks naturally.
-Don't just summarize sources or shuffle their sentences around. Think about the topic critically
-and write down your own take.
-
-Before writing, work through this privately and don't put any of it in the output:
-1. What is the actual development, problem, opportunity, or question here?
-2. What's the genuinely interesting detail, as opposed to the obvious headline everyone repeats?
-3. Why does it matter, who does it affect, and what could change because of it?
-4. What are the limits, trade-offs, practical consequences, or other ways to read it?
-5. Pick one specific angle. Don't write a general overview.
-6. Sort verified facts from company claims, assumptions, opinions, and predictions.
-7. Decide the one thing the reader should understand, question, or take away.
-
-Perspective and originality:
-- The post needs a clear point of view. Where it fits, include a practical implication readers may
-  have missed, a reasonable reading of the evidence, a limitation or open question, a comparison
-  that actually clarifies, or a hypothetical example that is clearly labelled as one.
-- Never make up personal experiences, customer stories, interviews, emotions, achievements, or
-  first-person claims. If the request supplies the author's own experience or opinion, keep it and
-  build the post around it. If it doesn't, write from an informed analytical view and don't pretend
-  to have firsthand experience.
-- Pick a structure that fits this particular subject. Don't run a stock template like a dramatic
-  hook followed by three balanced points and a lesson, or a row of punchy one-liners ending in an
-  inspirational line. Avoid made-up controversy.
-
-Facts and accuracy:
-- Get names, dates, product capabilities, statistics, and quotations right. Prefer primary sources,
-  official announcements, technical documentation, and credible reporting.
-- Say clearly when something is a company's own claim and not an independently verified result,
-  and keep any important qualifications.
-- Never invent facts, statistics, quotes, testimonials, or sources. If a claim can't be verified,
-  qualify it or leave it out. Don't present speculation as fact, and don't exaggerate a development
-  to make the post more engaging.
-
-Keywords: use the terms a knowledgeable person in this field would naturally use, including the
-technical vocabulary the audience expects. Don't stuff keywords in, and don't add trending terms
-that have nothing to do with the topic.
-
-LinkedIn tone: professional but conversational. Open with an observation that matters, explain why
-it matters, and give a practical takeaway only if there's a real one. Don't force a hook, a
-rhetorical question, an inspirational closing line, or a call to action.
-
-Before you answer, reread the draft the way a demanding editor would. Does the opening sound natural
-for this topic? Does it say something beyond a basic summary? Is every claim supported or qualified?
-Would a knowledgeable person actually phrase it this way? Can any sentence be shorter or clearer?
-Does the ending say something useful, or is it a predictable motivational line? Fix the weak parts
-before you respond.`;
 
 // Shared by generatePostText and revisePublishedPost, so a formatting rule only needs to be
 // stated once.
@@ -239,7 +191,7 @@ const POST_FORMAT_RULES = `Rules for the post:
 - Short paragraphs with white space between them, readable on a phone. Plain language that sounds like a real person, not corporate marketing copy.
 ${AI_TELL_RULES}
 - 0-3 relevant hashtags max, only at the very end.
-- 150-280 words.
+- About 150-300 words. Go shorter when the idea is simple; never add words just to look substantial.
 - No links in the post body.
 
 ${OUTPUT_FORMAT_RULES}`;
@@ -492,10 +444,12 @@ async function generateGroundedPost(prompt: string): Promise<GeneratedPost> {
 // the checklist holds it far more consistently. Not run through the search-enabled call: it isn't
 // researching anything new, just rephrasing what's already there.
 async function humanizePost(draftText: string): Promise<string> {
-  const prompt = `Rewrite the LinkedIn post below so it reads unmistakably like a specific human typed it, not
-an AI. Keep the same core message, facts, numbers, and length band as the original. This is a
-targeted line edit, not a chance to say something new: do not add facts, statistics, or personal
-experiences that aren't in the original, and keep any qualifications it makes.
+  const prompt = `Edit the LinkedIn post below so it is simple, clear, and easy to read, and sounds like a real
+person explaining something to a colleague, not an AI or an analyst report. A busy reader should get
+the point in one quick read on their phone. Split long sentences, break up dense paragraphs, swap
+jargon for plain words, and cut any detail the main point doesn't need. Keep the same core message
+and the key facts. This is an edit, not a chance to say something new: do not add facts,
+statistics, or personal experiences that aren't in the original.
 
 Original draft:
 """
@@ -578,6 +532,8 @@ ${research.brief}
 """
 
 How to use the research:
+- The research is background, not a checklist. Use only the two or three facts that matter most for
+  your angle, and leave the rest out. A post that crams in every finding is hard to read.
 - Build the post on the facts and on what people are actually saying, not on what the topic sounds like.
 - Skip the takes listed as overused. Look hardest at the underexplored angles and at where the
   official claims and real user experience don't match: that gap is usually the post.
